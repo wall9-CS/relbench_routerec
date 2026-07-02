@@ -105,11 +105,17 @@ def reachable_ads_for_user(
         if hop % 2 == 1:
             next_ads_with_time: list[tuple[pd.Timestamp, int]] = []
             for user in current_users:
-                next_ads_with_time.extend(user_to_ads.get(user, []))
+                next_ads_with_time.extend(
+                    [
+                        (event_time, ad)
+                        for event_time, ad in reversed(user_to_ads.get(user, []))
+                        if event_time <= timestamp
+                    ][:limit]
+                )
             next_ads = _limit_unique_recent(
                 next_ads_with_time,
                 timestamp,
-                limit,
+                len(next_ads_with_time),
                 excluded=seen_ads,
             )
             current_ads = set(next_ads)
@@ -182,16 +188,6 @@ def score_split(
 
         for hop in odd_hops:
             cumulative_ads.update(reachable_by_hop.get(hop, set()))
-            max_reachable = sum(
-                max(1, num_neighbors // (2 ** (prev_hop - 1)))
-                for prev_hop in odd_hops
-                if prev_hop <= hop
-            )
-            if len(cumulative_ads) > max_reachable:
-                raise RuntimeError(
-                    f"hop_{hop} reachable ads exceeded the budget "
-                    f"({len(cumulative_ads)} > {max_reachable})."
-                )
             hits = len(cumulative_ads & gt_ads)
             recall = hits / len(gt_ads)
             precision = hits / len(cumulative_ads) if cumulative_ads else 0.0
@@ -248,7 +244,7 @@ def main() -> None:
     parser.add_argument(
         "--out_dir",
         type=Path,
-        default=Path("localty_score/rel-avito/results"),
+        default=Path("locality_score/rel-avito/results"),
     )
     args = parser.parse_args()
 

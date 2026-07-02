@@ -2,7 +2,7 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 import pandas as pd
 from tqdm import tqdm
@@ -62,6 +62,11 @@ def _limit_unique_recent(
     return out
 
 
+class TemporalAdjacency(NamedTuple):
+    customer_to_articles: dict[int, list[tuple[pd.Timestamp, int]]]
+    article_to_customers: dict[int, list[tuple[pd.Timestamp, int]]]
+
+
 def build_temporal_indices(transactions: pd.DataFrame):
     customer_to_articles: dict[int, list[tuple[pd.Timestamp, int]]] = defaultdict(list)
     article_to_customers: dict[int, list[tuple[pd.Timestamp, int]]] = defaultdict(list)
@@ -75,6 +80,84 @@ def build_temporal_indices(transactions: pd.DataFrame):
         article_to_customers[article].append((event_time, customer))
 
     return customer_to_articles, article_to_customers
+
+
+def build_recent_adjacency_for_timestamp(
+    transactions: pd.DataFrame,
+    timestamp: pd.Timestamp,
+    max_article_neighbors: int,
+    max_customer_neighbors: int,
+) -> TemporalAdjacency:
+    """Precompute recent temporal neighbors needed for one timestamp.
+
+    Lists are globally time-descending within each node and already deduplicated.
+    """
+    customer_to_articles: dict[int, list[tuple[pd.Timestamp, int]]] = defaultdict(list)
+    article_to_customers: dict[int, list[tuple[pd.Timestamp, int]]] = defaultdict(list)
+    seen_customer_article: set[tuple[int, int]] = set()
+    seen_article_customer: set[tuple[int, int]] = set()
+
+    cols = ["t_dat", "customer_id", "article_id"]
+    events = (
+        transactions.loc[transactions["t_dat"] <= timestamp, cols]
+        .dropna()
+        .sort_values("t_dat", ascending=False)
+    )
+    for event_time, customer_id, article_id in events.itertuples(index=False, name=None):
+        customer = int(customer_id)
+        article = int(article_id)
+
+        if (
+            len(customer_to_articles[customer]) < max_article_neighbors
+            and (customer, article) not in seen_customer_article
+        ):
+            customer_to_articles[customer].append((event_time, article))
+            seen_customer_article.add((customer, article))
+
+        if (
+            len(article_to_customers[article]) < max_customer_neighbors
+            and (article, customer) not in seen_article_customer
+        ):
+            article_to_customers[article].append((event_time, customer))
+            seen_article_customer.add((article, customer))
+
+    return TemporalAdjacency(
+        customer_to_articles=dict(customer_to_articles),
+        article_to_customers=dict(article_to_customers),
+    )
+
+
+def build_recent_adjacencies(
+    transactions: pd.DataFrame,
+    timestamps: Iterable[pd.Timestamp],
+    max_hops: int,
+    num_neighbors: int,
+) -> dict[pd.Timestamp, TemporalAdjacency]:
+    odd_limits = [
+        max(1, num_neighbors // (2 ** (hop - 1)))
+        for hop in range(1, max_hops + 1)
+        if hop % 2 == 1
+    ]
+    even_limits = [
+        max(1, num_neighbors // (2 ** (hop - 1)))
+        for hop in range(1, max_hops + 1)
+        if hop % 2 == 0
+    ]
+    max_article_neighbors = max(odd_limits, default=1)
+    max_customer_neighbors = max(even_limits, default=1)
+
+    return {
+        timestamp: build_recent_adjacency_for_timestamp(
+            transactions,
+            timestamp,
+            max_article_neighbors=max_article_neighbors,
+            max_customer_neighbors=max_customer_neighbors,
+        )
+        for timestamp in tqdm(
+            sorted(set(pd.Timestamp(ts) for ts in timestamps)),
+            desc="Precomputing timestamp adjacencies",
+        )
+    }
 
 
 def reachable_articles_for_customer(
@@ -132,13 +215,64 @@ def reachable_articles_for_customer(
     return articles_by_hop
 
 
+def reachable_articles_for_customer_fast(
+    customer_id: int,
+    adjacency: TemporalAdjacency,
+    max_hops: int,
+    num_neighbors: int,
+) -> dict[int, set[int]]:
+    """Compute reachable articles with frontier-node fanout sampling."""
+    articles_by_hop: dict[int, set[int]] = {}
+    current_customers = {int(customer_id)}
+    current_articles: set[int] = set()
+    seen_articles: set[int] = set()
+
+    for hop in range(1, max_hops + 1):
+        limit = max(1, num_neighbors // (2 ** (hop - 1)))
+
+        if hop % 2 == 1:
+            next_articles_with_time: list[tuple[pd.Timestamp, int]] = []
+            for customer in current_customers:
+                next_articles_with_time.extend(
+                    adjacency.customer_to_articles.get(customer, [])[:limit]
+                )
+            current_articles = set(
+                _limit_unique_recent(
+                    next_articles_with_time,
+                    pd.Timestamp.max,
+                    len(next_articles_with_time),
+                    excluded=seen_articles,
+                )
+            )
+            seen_articles.update(current_articles)
+            articles_by_hop[hop] = set(current_articles)
+        else:
+            next_customers_with_time: list[tuple[pd.Timestamp, int]] = []
+            for article in current_articles:
+                next_customers_with_time.extend(
+                    adjacency.article_to_customers.get(article, [])[:limit]
+                )
+            current_customers = set(
+                _limit_unique_recent(
+                    next_customers_with_time,
+                    pd.Timestamp.max,
+                    len(next_customers_with_time),
+                )
+            )
+
+        if not current_customers and not current_articles:
+            break
+
+    return articles_by_hop
+
+
 def score_split(
     split: str,
     task,
-    customer_to_articles: dict[int, list[tuple[pd.Timestamp, int]]],
-    article_to_customers: dict[int, list[tuple[pd.Timestamp, int]]],
+    timestamp_adjacencies: dict[pd.Timestamp, TemporalAdjacency],
     max_hops: int,
     num_neighbors: int,
+    save_rows: bool,
 ) -> tuple[pd.DataFrame, dict[str, dict[str, float]]]:
     table = task.get_table(split, mask_input_cols=False)
     rows = []
@@ -155,6 +289,7 @@ def score_split(
         }
         for hop in odd_hops
     }
+    reachable_cache: dict[tuple[int, pd.Timestamp], dict[int, set[int]]] = {}
 
     iterator = tqdm(
         table.df.itertuples(index=False),
@@ -163,40 +298,33 @@ def score_split(
     )
     for row in iterator:
         customer_id = int(getattr(row, task.src_entity_col))
-        timestamp = getattr(row, task.time_col)
+        timestamp = pd.Timestamp(getattr(row, task.time_col))
         gt_articles = set(int(article) for article in getattr(row, task.dst_entity_col))
         if not gt_articles:
             continue
 
-        reachable_by_hop = reachable_articles_for_customer(
-            customer_id=customer_id,
-            timestamp=timestamp,
-            customer_to_articles=customer_to_articles,
-            article_to_customers=article_to_customers,
-            max_hops=max_hops,
-            num_neighbors=num_neighbors,
-        )
+        cache_key = (customer_id, timestamp)
+        if cache_key not in reachable_cache:
+            reachable_cache[cache_key] = reachable_articles_for_customer_fast(
+                customer_id=customer_id,
+                adjacency=timestamp_adjacencies[timestamp],
+                max_hops=max_hops,
+                num_neighbors=num_neighbors,
+            )
+        reachable_by_hop = reachable_cache[cache_key]
 
         cumulative_articles: set[int] = set()
-        row_result = {
-            "split": split,
-            "customer_id": customer_id,
-            "timestamp": timestamp,
-            "num_groundtruth": len(gt_articles),
-        }
+        row_result = None
+        if save_rows:
+            row_result = {
+                "split": split,
+                "customer_id": customer_id,
+                "timestamp": timestamp,
+                "num_groundtruth": len(gt_articles),
+            }
 
         for hop in odd_hops:
             cumulative_articles.update(reachable_by_hop.get(hop, set()))
-            max_reachable = sum(
-                max(1, num_neighbors // (2 ** (prev_hop - 1)))
-                for prev_hop in odd_hops
-                if prev_hop <= hop
-            )
-            if len(cumulative_articles) > max_reachable:
-                raise RuntimeError(
-                    f"hop_{hop} reachable articles exceeded the budget "
-                    f"({len(cumulative_articles)} > {max_reachable})."
-                )
             hits = len(cumulative_articles & gt_articles)
             recall = hits / len(gt_articles)
             precision = hits / len(cumulative_articles) if cumulative_articles else 0.0
@@ -209,12 +337,14 @@ def score_split(
             stats["sum_row_recall"] += recall
             stats["sum_row_precision"] += precision
 
-            row_result[f"hop_{hop}_reachable_articles"] = len(cumulative_articles)
-            row_result[f"hop_{hop}_hits"] = hits
-            row_result[f"hop_{hop}_locality_score"] = recall
-            row_result[f"hop_{hop}_precision"] = precision
+            if row_result is not None:
+                row_result[f"hop_{hop}_reachable_articles"] = len(cumulative_articles)
+                row_result[f"hop_{hop}_hits"] = hits
+                row_result[f"hop_{hop}_locality_score"] = recall
+                row_result[f"hop_{hop}_precision"] = precision
 
-        rows.append(row_result)
+        if row_result is not None:
+            rows.append(row_result)
 
     summary: dict[str, dict[str, float]] = {}
     for hop, stats in totals.items():
@@ -250,6 +380,7 @@ def main() -> None:
     parser.add_argument("--num_neighbors", type=int, default=128)
     parser.add_argument("--max_hops", type=int, default=3)
     parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save_rows", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--out_dir",
         type=Path,
@@ -265,7 +396,19 @@ def main() -> None:
     db = dataset.get_db(upto_test_timestamp=False)
 
     transactions = db.table_dict["transactions"].df
-    customer_to_articles, article_to_customers = build_temporal_indices(transactions)
+    split_tables = {
+        split: task.get_table(split, mask_input_cols=False)
+        for split in ["val", "test"]
+    }
+    timestamps = []
+    for table in split_tables.values():
+        timestamps.extend(pd.Timestamp(ts) for ts in table.df[task.time_col].unique())
+    timestamp_adjacencies = build_recent_adjacencies(
+        transactions,
+        timestamps=timestamps,
+        max_hops=args.max_hops,
+        num_neighbors=args.num_neighbors,
+    )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     all_summary = {
@@ -289,12 +432,13 @@ def main() -> None:
         detail_df, summary = score_split(
             split=split,
             task=task,
-            customer_to_articles=customer_to_articles,
-            article_to_customers=article_to_customers,
+            timestamp_adjacencies=timestamp_adjacencies,
             max_hops=args.max_hops,
             num_neighbors=args.num_neighbors,
+            save_rows=args.save_rows,
         )
-        detail_df.to_csv(args.out_dir / f"{split}_locality_rows.csv", index=False)
+        if args.save_rows:
+            detail_df.to_csv(args.out_dir / f"{split}_locality_rows.csv", index=False)
         all_summary["splits"][split] = summary
 
     with open(args.out_dir / "summary.json", "w") as f:
