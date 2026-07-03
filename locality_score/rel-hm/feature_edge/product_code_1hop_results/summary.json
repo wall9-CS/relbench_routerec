@@ -1,0 +1,78 @@
+{
+  "dataset": "rel-hm",
+  "task": "user-item-purchase",
+  "num_neighbors": 128,
+  "max_hops": 1,
+  "feature": "article.product_code",
+  "feature_fanout": 128,
+  "candidate_scope": "historical",
+  "max_feature_group_size": null,
+  "snapshot_mode": "static_single_cutoff_per_split",
+  "definition": {
+    "baseline": "Customer's recent historical transactions (as of the split's single seed_time) are treated as conceptual 1-hop reachable articles.",
+    "product_code": "Articles sharing product_code with baseline reachable articles are also treated as analysis-only 1-hop reachable articles.",
+    "locality_score": "groundtruth articles reachable from the 1-hop candidate set divided by all groundtruth articles"
+  },
+  "splits": {
+    "val": {
+      "baseline": {
+        "locality_score_micro": 0.03485528268789637,
+        "locality_score_macro": 0.04474207500044644,
+        "neighbor_groundtruth_ratio_micro": 0.004431344714230267,
+        "neighbor_groundtruth_ratio_macro": 0.007276371227350631,
+        "num_rows": 74575,
+        "num_groundtruth_articles": 237152,
+        "num_reachable_articles": 1865348,
+        "num_groundtruth_reachable_articles": 8266
+      },
+      "product_code": {
+        "locality_score_micro": 0.07548323438132505,
+        "locality_score_macro": 0.08921289046988487,
+        "neighbor_groundtruth_ratio_micro": 0.0023964525915115965,
+        "neighbor_groundtruth_ratio_macro": 0.0031827427677491586,
+        "num_rows": 74575,
+        "num_groundtruth_articles": 237152,
+        "num_reachable_articles": 7469791,
+        "num_groundtruth_reachable_articles": 17901,
+        "delta_vs_baseline": {
+          "locality_score_micro": 0.04062795169342868,
+          "locality_score_macro": 0.04447081546943843,
+          "neighbor_groundtruth_ratio_micro": -0.0020348921227186707,
+          "neighbor_groundtruth_ratio_macro": -0.004093628459601472,
+          "num_reachable_articles": 5604443,
+          "num_groundtruth_reachable_articles": 9635
+        }
+      }
+    },
+    "test": {
+      "baseline": {
+        "locality_score_micro": 0.037236293005634725,
+        "locality_score_macro": 0.04809388996095142,
+        "neighbor_groundtruth_ratio_micro": 0.00457912004034592,
+        "neighbor_groundtruth_ratio_macro": 0.007461264102098337,
+        "num_rows": 67144,
+        "num_groundtruth_articles": 207996,
+        "num_reachable_articles": 1691373,
+        "num_groundtruth_reachable_articles": 7745
+      },
+      "product_code": {
+        "locality_score_micro": 0.07841496951864459,
+        "locality_score_macro": 0.09080843688955022,
+        "neighbor_groundtruth_ratio_micro": 0.0024124360412323925,
+        "neighbor_groundtruth_ratio_macro": 0.003275488109266013,
+        "num_rows": 67144,
+        "num_groundtruth_articles": 207996,
+        "num_reachable_articles": 6760801,
+        "num_groundtruth_reachable_articles": 16310,
+        "delta_vs_baseline": {
+          "locality_score_micro": 0.04117867651300986,
+          "locality_score_macro": 0.042714546928598794,
+          "neighbor_groundtruth_ratio_micro": -0.0021666839991135276,
+          "neighbor_groundtruth_ratio_macro": -0.004185775992832324,
+          "num_reachable_articles": 5069428,
+          "num_groundtruth_reachable_articles": 8565
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "feature": "article.index_code",
+  "case_name": "index_code",
+  "snapshot_mode": "static_single_cutoff_per_split",
+  "splits": {
+    "val": {
+      "baseline": {
+        "locality_score_micro": 0.03485528268789637,
+        "locality_score_macro": 0.04474207500044644,
+        "neighbor_groundtruth_ratio_micro": 0.004431344714230267,
+        "neighbor_groundtruth_ratio_macro": 0.007276371227350631,
+        "num_rows": 74575,
+        "num_groundtruth_articles": 237152,
+        "num_reachable_articles": 1865348,
+        "num_groundtruth_reachable_articles": 8266
+      },
+      "index_code": {
+        "locality_score_micro": 0.05544545270543786,
+        "locality_score_macro": 0.06410528371286002,
+        "neighbor_groundtruth_ratio_micro": 0.0012619810943734204,
+        "neighbor_groundtruth_ratio_macro": 0.001082553793864418,
+        "num_rows": 74575,
+        "num_groundtruth_articles": 237152,
+        "num_reachable_articles": 10419332,
+        "num_groundtruth_reachable_articles": 13149,
+        "delta_vs_baseline": {
+          "locality_score_micro": 0.020590170017541487,
+          "locality_score_macro": 0.01936320871241358,
+          "neighbor_groundtruth_ratio_micro": -0.003169363619856847,
+          "neighbor_groundtruth_ratio_macro": -0.006193817433486213,
+          "num_reachable_articles": 8553984,
+          "num_groundtruth_reachable_articles": 4883
+        }
+      }
+    },
+    "test": {
+      "baseline": {
+        "locality_score_micro": 0.037236293005634725,
+        "locality_score_macro": 0.04809388996095142,
+        "neighbor_groundtruth_ratio_micro": 0.00457912004034592,
+        "neighbor_groundtruth_ratio_macro": 0.007461264102098337,
+        "num_rows": 67144,
+        "num_groundtruth_articles": 207996,
+        "num_reachable_articles": 1691373,
+        "num_groundtruth_reachable_articles": 7745
+      },
+      "index_code": {
+        "locality_score_micro": 0.05454912594472971,
+        "locality_score_macro": 0.06459814555945675,
+        "neighbor_groundtruth_ratio_micro": 0.0012114033348505236,
+        "neighbor_groundtruth_ratio_macro": 0.0010404334737438604,
+        "num_rows": 67144,
+        "num_groundtruth_articles": 207996,
+        "num_reachable_articles": 9365997,
+        "num_groundtruth_reachable_articles": 11346,
+        "delta_vs_baseline": {
+          "locality_score_micro": 0.017312832939094983,
+          "locality_score_macro": 0.01650425559850533,
+          "neighbor_groundtruth_ratio_micro": -0.0033677167054953962,
+          "neighbor_groundtruth_ratio_macro": -0.006420830628354477,
+          "num_reachable_articles": 7674624,
+          "num_groundtruth_reachable_articles": 3601
+        }
+      }
+    }
+  }
+}
