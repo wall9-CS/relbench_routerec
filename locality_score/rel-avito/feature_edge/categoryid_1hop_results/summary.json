@@ -1,0 +1,78 @@
+{
+  "dataset": "rel-avito",
+  "task": "user-ad-visit",
+  "num_neighbors": 128,
+  "max_hops": 1,
+  "feature": "AdsInfo.CategoryID",
+  "feature_fanout": 128,
+  "candidate_scope": "historical",
+  "max_category_group_size": null,
+  "snapshot_mode": "static_single_cutoff_per_split",
+  "definition": {
+    "baseline": "User's recent historical VisitStream ads (as of the split's single seed_time) are treated as conceptual 1-hop reachable ads.",
+    "categoryid": "Ads sharing CategoryID with baseline reachable ads are also treated as analysis-only 1-hop reachable ads.",
+    "locality_score": "groundtruth ads reachable from the 1-hop candidate set divided by all groundtruth ads"
+  },
+  "splits": {
+    "val": {
+      "baseline": {
+        "locality_score_micro": 0.049936121061131176,
+        "locality_score_macro": 0.0837259446326128,
+        "neighbor_groundtruth_ratio_micro": 0.03350011009713014,
+        "neighbor_groundtruth_ratio_macro": 0.03603906009985526,
+        "num_rows": 29979,
+        "num_groundtruth_ads": 877441,
+        "num_reachable_ads": 1307936,
+        "num_groundtruth_reachable_ads": 43816
+      },
+      "categoryid": {
+        "locality_score_micro": 0.050144682092585144,
+        "locality_score_macro": 0.08396621104669716,
+        "neighbor_groundtruth_ratio_micro": 0.00988695359857337,
+        "neighbor_groundtruth_ratio_macro": 0.007275619952161674,
+        "num_rows": 29979,
+        "num_groundtruth_ads": 877441,
+        "num_reachable_ads": 4450208,
+        "num_groundtruth_reachable_ads": 43999,
+        "delta_vs_baseline": {
+          "locality_score_micro": 0.00020856103145396737,
+          "locality_score_macro": 0.000240266414084353,
+          "neighbor_groundtruth_ratio_micro": -0.02361315649855677,
+          "neighbor_groundtruth_ratio_macro": -0.028763440147693588,
+          "num_reachable_ads": 3142272,
+          "num_groundtruth_reachable_ads": 183
+        }
+      }
+    },
+    "test": {
+      "baseline": {
+        "locality_score_micro": 0.04637544969389258,
+        "locality_score_macro": 0.06341459771715252,
+        "neighbor_groundtruth_ratio_micro": 0.024869204456224484,
+        "neighbor_groundtruth_ratio_macro": 0.023671283003781633,
+        "num_rows": 36129,
+        "num_groundtruth_ads": 712985,
+        "num_reachable_ads": 1329556,
+        "num_groundtruth_reachable_ads": 33065
+      },
+      "categoryid": {
+        "locality_score_micro": 0.04656619704481862,
+        "locality_score_macro": 0.0636255423932619,
+        "neighbor_groundtruth_ratio_micro": 0.007312705663652102,
+        "neighbor_groundtruth_ratio_macro": 0.004552393651835001,
+        "num_rows": 36129,
+        "num_groundtruth_ads": 712985,
+        "num_reachable_ads": 4540180,
+        "num_groundtruth_reachable_ads": 33201,
+        "delta_vs_baseline": {
+          "locality_score_micro": 0.00019074735092603629,
+          "locality_score_macro": 0.0002109446761093814,
+          "neighbor_groundtruth_ratio_micro": -0.017556498792572383,
+          "neighbor_groundtruth_ratio_macro": -0.01911888935194663,
+          "num_reachable_ads": 3210624,
+          "num_groundtruth_reachable_ads": 136
+        }
+      }
+    }
+  }
+}
