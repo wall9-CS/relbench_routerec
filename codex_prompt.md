@@ -1,4 +1,3 @@
-You are working in a checkout whose directory layout matches `stanford-star/relbench`.
 
 Implement the task defined in `spec.md`.
 
