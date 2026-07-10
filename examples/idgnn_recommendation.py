@@ -9,6 +9,11 @@ from typing import Dict, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from hm_product_code_expansion import (
+    augment_hm_graph_with_virtual_transactions,
+    build_product_code_virtual_candidates,
+    format_expansion_diagnostics,
+)
 from model import Model
 from text_embedder import GloveTextEmbedding
 from torch import Tensor
@@ -37,6 +42,9 @@ parser.add_argument("--channels", type=int, default=128)
 parser.add_argument("--aggr", type=str, default="sum")
 parser.add_argument("--num_layers", type=int, default=2)
 parser.add_argument("--num_neighbors", type=int, default=128)
+parser.add_argument("--test_product_code_expansion", action="store_true")
+parser.add_argument("--product_code_max_virtual_per_customer", type=int, default=0)
+parser.add_argument("--test_num_neighbors", type=int, default=None)
 parser.add_argument("--temporal_strategy", type=str, default="last")
 parser.add_argument("--max_steps_per_epoch", type=int, default=2000)
 parser.add_argument("--num_workers", type=int, default=0)
@@ -45,6 +53,18 @@ parser.add_argument(
     "--cache_dir", type=str, default=os.path.expanduser("~/.cache/relbench_examples")
 )
 args = parser.parse_args()
+
+if args.product_code_max_virtual_per_customer < 0:
+    raise ValueError("--product_code_max_virtual_per_customer must be non-negative")
+if args.test_num_neighbors is not None and args.test_num_neighbors <= 0:
+    raise ValueError("--test_num_neighbors must be positive when specified")
+if args.test_product_code_expansion and (
+    args.dataset != "rel-hm" or args.task != "user-item-purchase"
+):
+    raise ValueError(
+        "--test_product_code_expansion is only supported for "
+        "rel-hm/user-item-purchase"
+    )
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -70,7 +90,7 @@ except FileNotFoundError:
     with open(stypes_cache_path, "w") as f:
         json.dump(col_to_stype_dict, f, indent=2, default=str)
 
-data, col_stats_dict = make_pkey_fkey_graph(
+base_data, col_stats_dict = make_pkey_fkey_graph(
     dataset.get_db(),
     col_to_stype_dict=col_to_stype_dict,
     text_embedder_cfg=TextEmbedderConfig(
@@ -80,15 +100,21 @@ data, col_stats_dict = make_pkey_fkey_graph(
 )
 
 num_neighbors = [int(args.num_neighbors // 2**i) for i in range(args.num_layers)]
+test_neighbor_base = (
+    args.num_neighbors if args.test_num_neighbors is None else args.test_num_neighbors
+)
+test_num_neighbors = [
+    int(test_neighbor_base // 2**i) for i in range(args.num_layers)
+]
 
 loader_dict: Dict[str, NeighborLoader] = {}
 dst_nodes_dict: Dict[str, Tuple[NodeType, Tensor]] = {}
-for split in ["train", "val", "test"]:
+for split in ["train", "val"]:
     table = task.get_table(split)
     table_input = get_link_train_table_input(table, task)
     dst_nodes_dict[split] = table_input.dst_nodes
     loader_dict[split] = NeighborLoader(
-        data,
+        base_data,
         num_neighbors=num_neighbors,
         time_attr="time",
         input_nodes=table_input.src_nodes,
@@ -102,7 +128,7 @@ for split in ["train", "val", "test"]:
     )
 
 model = Model(
-    data=data,
+    data=base_data,
     col_stats_dict=col_stats_dict,
     num_layers=args.num_layers,
     channels=args.channels,
@@ -213,6 +239,42 @@ val_pred = test(loader_dict["val"])
 val_metrics = task.evaluate(val_pred, task.get_table("val"))
 print(f"Best Val metrics: {val_metrics}")
 
-test_pred = test(loader_dict["test"])
+test_table = task.get_table("test")
+test_table_input = get_link_train_table_input(test_table, task)
+test_data = base_data
+
+if args.test_product_code_expansion:
+    candidates, expansion_stats = build_product_code_virtual_candidates(
+        dataset.get_db(),
+        test_table,
+        max_virtual_per_customer=args.product_code_max_virtual_per_customer,
+    )
+    test_data = augment_hm_graph_with_virtual_transactions(base_data, candidates)
+    print(
+        format_expansion_diagnostics(
+            expansion_stats,
+            max_virtual_per_customer=args.product_code_max_virtual_per_customer,
+            base_num_transactions=len(base_data["transactions"].tf),
+            augmented_num_transactions=len(test_data["transactions"].tf),
+            train_val_num_neighbors=num_neighbors,
+            test_num_neighbors=test_num_neighbors,
+        )
+    )
+
+test_loader = NeighborLoader(
+    test_data,
+    num_neighbors=test_num_neighbors,
+    time_attr="time",
+    input_nodes=test_table_input.src_nodes,
+    input_time=test_table_input.src_time,
+    subgraph_type="bidirectional",
+    batch_size=args.batch_size,
+    temporal_strategy=args.temporal_strategy,
+    shuffle=False,
+    num_workers=args.num_workers,
+    persistent_workers=args.num_workers > 0,
+)
+
+test_pred = test(test_loader)
 test_metrics = task.evaluate(test_pred)
 print(f"Best test metrics: {test_metrics}")
