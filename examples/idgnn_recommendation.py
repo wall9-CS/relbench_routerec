@@ -57,21 +57,42 @@ task: RecommendationTask = get_task(args.dataset, args.task, download=True)
 tune_metric = "link_prediction_map"
 assert task.task_type == TaskType.LINK_PREDICTION
 
+db = dataset.get_db()
 stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
-try:
-    with open(stypes_cache_path, "r") as f:
-        col_to_stype_dict = json.load(f)
+
+
+def _convert_stypes(col_to_stype_dict):
     for table, col_to_stype in col_to_stype_dict.items():
         for col, stype_str in col_to_stype.items():
             col_to_stype[col] = stype(stype_str)
+    return col_to_stype_dict
+
+
+def _stypes_cache_matches_db(col_to_stype_dict, db):
+    if set(col_to_stype_dict.keys()) != set(db.table_dict.keys()):
+        return False
+    for table_name, table in db.table_dict.items():
+        if set(col_to_stype_dict[table_name].keys()) != set(table.df.columns):
+            return False
+    return True
+
+
+try:
+    with open(stypes_cache_path, "r") as f:
+        loaded_col_to_stype_dict = json.load(f)
+    col_to_stype_dict = _convert_stypes(loaded_col_to_stype_dict)
+    if not _stypes_cache_matches_db(col_to_stype_dict, db):
+        col_to_stype_dict = get_stype_proposal(db)
+        with open(stypes_cache_path, "w") as f:
+            json.dump(col_to_stype_dict, f, indent=2, default=str)
 except FileNotFoundError:
-    col_to_stype_dict = get_stype_proposal(dataset.get_db())
+    col_to_stype_dict = get_stype_proposal(db)
     Path(stypes_cache_path).parent.mkdir(parents=True, exist_ok=True)
     with open(stypes_cache_path, "w") as f:
         json.dump(col_to_stype_dict, f, indent=2, default=str)
 
 data, col_stats_dict = make_pkey_fkey_graph(
-    dataset.get_db(),
+    db,
     col_to_stype_dict=col_to_stype_dict,
     text_embedder_cfg=TextEmbedderConfig(
         text_embedder=GloveTextEmbedding(device=device), batch_size=256
