@@ -12,7 +12,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import Tensor
 from torch_frame import stype
 from torch_frame.config.text_embedder import TextEmbedderConfig
 from torch_geometric.seed import seed_everything
@@ -32,14 +31,15 @@ from relbench.modeling.loader import SparseTensor
 from relbench.modeling.utils import get_stype_proposal
 from relbench.tasks import get_task
 
-from .hm_cf.coverage import compute_cf_coverage_for_split
-from .hm_cf.graph import (
-    article_cf_col_stats,
+from .avito_cf.coverage import compute_cf_coverage_for_split
+from .avito_cf.graph import (
+    ad_cf_col_stats,
     attach_cf_snapshot,
     build_cf_num_neighbors,
     build_cf_schema_template,
 )
-from .hm_cf.io import load_snapshot, validate_manifest_for_training
+from .avito_cf.interactions import filter_visit_interactions
+from .avito_cf.io import load_snapshot, validate_manifest_for_training
 from .hm_cf.seed_time_loader import (
     SeedTimeGroup,
     group_recommendation_table_by_seed_time,
@@ -50,10 +50,10 @@ from .hm_cf.seed_time_loader import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train ID-GNN with seed-time-specific Rel-HM CF snapshots."
+        description="Train ID-GNN with seed-time-specific Rel-Avito CF snapshots."
     )
-    parser.add_argument("--dataset", type=str, default="rel-hm")
-    parser.add_argument("--task", type=str, default="user-item-purchase")
+    parser.add_argument("--dataset", type=str, default="rel-avito")
+    parser.add_argument("--task", type=str, default="user-ad-visit")
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--eval_epochs_interval", type=int, default=1)
@@ -90,26 +90,26 @@ def _load_stypes(dataset: Dataset, args: argparse.Namespace) -> dict:
     return col_to_stype_dict
 
 
-def _load_group_graph(base_data, snapshot_dir, group, config, num_articles):
+def _load_group_graph(base_data, snapshot_dir, group, config, num_ads):
     snapshot = load_snapshot(
         snapshot_dir,
         group.seed_time,
         validate=True,
         config=config,
-        num_articles=num_articles,
+        num_ads=num_ads,
     )
     return attach_cf_snapshot(
         base_data,
         snapshot,
         group.seed_time,
-        num_articles=num_articles,
+        num_ads=num_ads,
     )
 
 
 def main() -> None:
     args = parse_args()
     if args.num_layers < 4:
-        raise ValueError("CF augmentation requires --num_layers >= 4.")
+        raise ValueError("Avito CF augmentation requires --num_layers >= 4.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
@@ -128,22 +128,22 @@ def main() -> None:
     task: RecommendationTask = get_task(args.dataset, args.task, download=True)
     tune_metric = "link_prediction_map"
     assert task.task_type == TaskType.LINK_PREDICTION
-    num_articles = task.num_dst_nodes
+    num_ads = task.num_dst_nodes
     db = dataset.get_db()
 
     if args.report_cf_coverage:
-        transactions = db.table_dict["transactions"].df
+        interactions = filter_visit_interactions(db.table_dict["VisitStream"].df)
         for split in ["val", "test"]:
             metrics = compute_cf_coverage_for_split(
                 task,
                 split,
-                transactions,
+                interactions,
                 args.cf_snapshot_dir,
                 config=config,
-                num_articles=num_articles,
+                num_ads=num_ads,
                 num_layers=args.num_layers,
             )
-            print(f"CF coverage {split}: {metrics.to_dict()}")
+            print(f"Avito CF coverage {split}: {metrics.to_dict()}")
 
     col_to_stype_dict = _load_stypes(dataset, args)
     base_data, col_stats_dict = make_pkey_fkey_graph(
@@ -155,7 +155,7 @@ def main() -> None:
         cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
     )
     schema_data = build_cf_schema_template(base_data)
-    col_stats_dict = {**col_stats_dict, "article_cf": article_cf_col_stats()}
+    col_stats_dict = {**col_stats_dict, "ad_cf": ad_cf_col_stats()}
     num_neighbors = build_cf_num_neighbors(
         schema_data.edge_types,
         num_layers=args.num_layers,
@@ -173,7 +173,7 @@ def main() -> None:
                 group.seed_time,
                 validate=True,
                 config=config,
-                num_articles=num_articles,
+                num_ads=num_ads,
             )
 
     model = Model(
@@ -197,7 +197,7 @@ def main() -> None:
         pbar = tqdm(total=args.max_steps_per_epoch)
         for group in train_groups:
             graph = _load_group_graph(
-                base_data, args.cf_snapshot_dir, group, config, num_articles
+                base_data, args.cf_snapshot_dir, group, config, num_ads
             )
             loader, table_input = make_seed_time_loader(
                 graph,
@@ -249,7 +249,7 @@ def main() -> None:
     def test_group(group: SeedTimeGroup) -> np.ndarray:
         model.eval()
         graph = _load_group_graph(
-            base_data, args.cf_snapshot_dir, group, config, num_articles
+            base_data, args.cf_snapshot_dir, group, config, num_ads
         )
         loader, _ = make_seed_time_loader(
             graph,
