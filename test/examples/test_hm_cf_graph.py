@@ -3,34 +3,38 @@ import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
+from torch_frame import stype
+from torch_frame.data import Dataset
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.typing import WITH_PYG_LIB
 
 from examples.model import Model
 from examples.hm_cf.graph import (
-    ARTICLE_CF,
-    CF_DST_F2P,
-    CF_DST_REV,
+    CF_DST_TO_SRC,
     CF_EDGE_TYPES,
-    CF_SRC_F2P,
-    CF_SRC_REV,
-    article_cf_col_stats,
+    CF_SRC_TO_DST,
     attach_cf_snapshot,
     build_cf_num_neighbors,
     build_cf_schema_template,
-    make_article_cf_tensor_frame,
 )
 from relbench.modeling.utils import to_unix_time
 
 
+def _const_tensor_frame(num_rows: int):
+    df = pd.DataFrame({"__const__": np.ones(num_rows, dtype=np.float32)})
+    return Dataset(df=df, col_to_stype={"__const__": stype.numerical}).materialize()
+
+
 def _base_graph(num_articles=4):
     data = HeteroData()
-    data["article"].tf = make_article_cf_tensor_frame(num_articles).tensor_frame
+    data["article"].tf = _const_tensor_frame(num_articles).tensor_frame
     data["article"].time = torch.zeros(num_articles, dtype=torch.long)
-    data["customer"].tf = make_article_cf_tensor_frame(1).tensor_frame
-    data["customer"].time = torch.tensor([to_unix_time(pd.Series([pd.Timestamp("2020-03-02")]))[0]])
-    data["transactions"].tf = make_article_cf_tensor_frame(1).tensor_frame
+    data["customer"].tf = _const_tensor_frame(1).tensor_frame
+    data["customer"].time = torch.tensor(
+        [to_unix_time(pd.Series([pd.Timestamp("2020-03-02")]))[0]]
+    )
+    data["transactions"].tf = _const_tensor_frame(1).tensor_frame
     data["transactions"].time = torch.tensor(
         [to_unix_time(pd.Series([pd.Timestamp("2020-02-28")]))[0]]
     )
@@ -62,13 +66,15 @@ def _snapshot(seed="2020-03-02"):
     )
 
 
-def test_no_model_feature_and_col_stats_are_constant_only():
+def test_snapshot_columns_are_not_model_features():
     data = attach_cf_snapshot(_base_graph(), _snapshot(), pd.Timestamp("2020-03-02"))
-    assert data[ARTICLE_CF].tf.col_names_dict.keys()
-    assert data[ARTICLE_CF].tf.col_names_dict[next(iter(data[ARTICLE_CF].tf.col_names_dict))] == [
-        "__const__"
-    ]
-    assert set(article_cf_col_stats()) == {"__const__"}
+    assert data.node_types == ["article", "customer", "transactions"]
+    for edge_type in CF_EDGE_TYPES:
+        store = data[edge_type]
+        assert "edge_attr" not in store
+        assert "support" not in store
+        assert "cf_score" not in store
+        assert "rank" not in store
 
 
 def test_base_graph_immutability():
@@ -78,16 +84,17 @@ def test_base_graph_immutability():
     attached = attach_cf_snapshot(base, _snapshot(), pd.Timestamp("2020-03-02"))
     assert base.node_types == original_node_types
     assert base.edge_types == original_edge_types
-    assert ARTICLE_CF in attached.node_types
-    assert ARTICLE_CF not in base.node_types
+    assert attached.node_types == original_node_types
+    assert CF_SRC_TO_DST in attached.edge_types
+    assert CF_DST_TO_SRC in attached.edge_types
+    assert CF_SRC_TO_DST not in base.edge_types
+    assert CF_DST_TO_SRC not in base.edge_types
 
 
 def test_graph_edge_roles_exact():
     data = attach_cf_snapshot(_base_graph(), _snapshot(), pd.Timestamp("2020-03-02"))
-    assert torch.equal(data[CF_SRC_F2P].edge_index, torch.tensor([[0, 1], [0, 2]]))
-    assert torch.equal(data[CF_SRC_REV].edge_index, torch.tensor([[0, 2], [0, 1]]))
-    assert torch.equal(data[CF_DST_F2P].edge_index, torch.tensor([[0, 1], [1, 0]]))
-    assert torch.equal(data[CF_DST_REV].edge_index, torch.tensor([[0, 1], [1, 0]]))
+    assert torch.equal(data[CF_SRC_TO_DST].edge_index, torch.tensor([[0, 2], [1, 0]]))
+    assert torch.equal(data[CF_DST_TO_SRC].edge_index, torch.tensor([[0, 1], [2, 0]]))
 
 
 def test_schema_template_and_fanouts():
@@ -95,13 +102,13 @@ def test_schema_template_and_fanouts():
     for edge_type in CF_EDGE_TYPES:
         assert edge_type in template.edge_types
         assert template[edge_type].edge_index.numel() == 0
-    fanouts = build_cf_num_neighbors(template.edge_types, num_layers=4, num_neighbors=128)
-    assert fanouts[CF_SRC_F2P] == [0, 0, 32, 0]
-    assert fanouts[CF_DST_REV] == [0, 0, 0, 16]
-    assert fanouts[CF_DST_F2P] == [0, 0, 0, 0]
-    assert fanouts[CF_SRC_REV] == [0, 0, 0, 0]
+    fanouts = build_cf_num_neighbors(
+        template.edge_types, num_layers=4, num_neighbors=128
+    )
+    assert fanouts[CF_SRC_TO_DST] == [0, 0, 0, 0]
+    assert fanouts[CF_DST_TO_SRC] == [0, 0, 32, 0]
     with pytest.raises(ValueError, match="num_layers"):
-        build_cf_num_neighbors(template.edge_types, num_layers=3, num_neighbors=128)
+        build_cf_num_neighbors(template.edge_types, num_layers=2, num_neighbors=128)
 
 
 def test_seed_time_isolation_by_exact_attachment():
@@ -112,36 +119,36 @@ def test_seed_time_isolation_by_exact_attachment():
     snap2 = _snapshot(t2)
     snap2["dst_article_id"] = [3, 1]
     g2 = attach_cf_snapshot(base, snap2, t2)
-    assert set(g1[CF_DST_F2P].edge_index[1].tolist()) == {0, 1}
-    assert set(g2[CF_DST_F2P].edge_index[1].tolist()) == {1, 3}
-    assert g1[ARTICLE_CF].time.unique().item() != g2[ARTICLE_CF].time.unique().item()
+    assert set(g1[CF_SRC_TO_DST].edge_index[1].tolist()) == {0, 1}
+    assert set(g2[CF_SRC_TO_DST].edge_index[1].tolist()) == {1, 3}
 
 
-def test_four_hop_reachability_route_with_static_graph():
+def test_direct_three_hop_reachability_route_with_static_graph():
     data = attach_cf_snapshot(_base_graph(), _snapshot(), pd.Timestamp("2020-03-02"))
     tx_to_customer = data[("transactions", "f2p_customer_id", "customer")].edge_index
     tx = tx_to_customer[0, tx_to_customer[1] == 0]
     article_src = data[("transactions", "f2p_article_id", "article")].edge_index[1]
     assert article_src[tx].tolist() == [0]
-    cf_from_src = data[CF_SRC_F2P].edge_index[0][data[CF_SRC_F2P].edge_index[1] == 0]
-    dst = data[CF_DST_F2P].edge_index[1][torch.isin(data[CF_DST_F2P].edge_index[0], cf_from_src)]
-    assert dst.tolist() == [1]
-    reverse_only = data[CF_DST_F2P].edge_index[0][data[CF_DST_F2P].edge_index[1] == 0]
-    assert set(reverse_only.tolist()) == {1}
-    assert not torch.isin(reverse_only, cf_from_src).any()
+    candidates = data[CF_DST_TO_SRC].edge_index[0][
+        data[CF_DST_TO_SRC].edge_index[1] == article_src[tx].item()
+    ]
+    assert candidates.tolist() == [1]
+    assert not torch.isin(torch.tensor([2]), candidates).any()
 
 
 def test_neighbor_loader_route_skips_without_temporal_backend():
     if not WITH_PYG_LIB:
         pytest.skip("PyG temporal NeighborLoader requires pyg-lib in this environment.")
     data = attach_cf_snapshot(_base_graph(), _snapshot(), pd.Timestamp("2020-03-02"))
-    fanouts = build_cf_num_neighbors(data.edge_types, num_layers=4, num_neighbors=8)
+    fanouts = build_cf_num_neighbors(data.edge_types, num_layers=3, num_neighbors=8)
     loader = NeighborLoader(
         data,
         num_neighbors=fanouts,
         time_attr="time",
         input_nodes=("customer", torch.tensor([0])),
-        input_time=torch.tensor([to_unix_time(pd.Series([pd.Timestamp("2020-03-02")]))[0]]),
+        input_time=torch.tensor(
+            [to_unix_time(pd.Series([pd.Timestamp("2020-03-02")]))[0]]
+        ),
         subgraph_type="bidirectional",
         batch_size=1,
         temporal_strategy="uniform",
@@ -161,11 +168,13 @@ def test_smoke_model_forward_backward_and_topk():
     data["customer"].seed_time = torch.tensor(
         [to_unix_time(pd.Series([pd.Timestamp("2020-03-02")]))[0]]
     )
-    col_stats = {node_type: article_cf_col_stats() for node_type in data.node_types}
+    col_stats = {
+        node_type: _const_tensor_frame(1).col_stats for node_type in data.node_types
+    }
     model = Model(
         data=data,
         col_stats_dict=col_stats,
-        num_layers=4,
+        num_layers=3,
         channels=8,
         out_channels=1,
         aggr="sum",

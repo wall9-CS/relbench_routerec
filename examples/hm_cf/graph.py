@@ -6,34 +6,15 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 import torch
-from torch_frame import stype
-from torch_frame.data import Dataset
-from torch_frame.data.stats import StatType
 from torch_geometric.data import HeteroData
 from torch_geometric.typing import EdgeType
 from torch_geometric.utils import sort_edge_index
 
-from relbench.modeling.utils import to_unix_time
-
 from .io import validate_snapshot_frame
 
-ARTICLE_CF = "article_cf"
-CF_SRC_F2P: EdgeType = (ARTICLE_CF, "f2p_src_article_id", "article")
-CF_SRC_REV: EdgeType = ("article", "rev_f2p_src_article_id", ARTICLE_CF)
-CF_DST_F2P: EdgeType = (ARTICLE_CF, "f2p_dst_article_id", "article")
-CF_DST_REV: EdgeType = ("article", "rev_f2p_dst_article_id", ARTICLE_CF)
-CF_EDGE_TYPES = (CF_SRC_F2P, CF_SRC_REV, CF_DST_F2P, CF_DST_REV)
-
-
-def make_article_cf_tensor_frame(num_rows: int):
-    """Create the only model-facing feature for article_cf rows."""
-    df = pd.DataFrame({"__const__": np.ones(num_rows, dtype=np.float32)})
-    return Dataset(df=df, col_to_stype={"__const__": stype.numerical}).materialize()
-
-
-def article_cf_col_stats() -> dict[str, dict[StatType, object]]:
-    dataset = make_article_cf_tensor_frame(1)
-    return dataset.col_stats
+CF_SRC_TO_DST: EdgeType = ("article", "cf_src_to_dst_article_id", "article")
+CF_DST_TO_SRC: EdgeType = ("article", "rev_cf_src_to_dst_article_id", "article")
+CF_EDGE_TYPES = (CF_SRC_TO_DST, CF_DST_TO_SRC)
 
 
 def attach_cf_snapshot(
@@ -43,10 +24,12 @@ def attach_cf_snapshot(
     *,
     num_articles: int | None = None,
 ) -> HeteroData:
-    """Return a shallow graph copy with exactly one CF snapshot attached.
+    """Return a shallow graph copy with exactly one direct article-CF snapshot.
 
-    Existing base graph tensors are shared with `base_data`; the CF node and edge
-    stores are replaced only on the returned object.
+    Existing base graph tensors are shared with `base_data`; only direct
+    article-to-article CF edge stores are added or replaced on the returned
+    object. The reverse edge direction is the sampling expansion route:
+    destination candidate article -> historical source article.
     """
     if num_articles is None:
         num_articles = int(base_data["article"].num_nodes)
@@ -57,28 +40,17 @@ def attach_cf_snapshot(
         num_articles=num_articles,
     )
     data = copy.copy(base_data)
-    num_rows = len(snapshot)
-    cf_ids = torch.arange(num_rows, dtype=torch.long)
-    seed_time = pd.Timestamp(seed_time)
-
-    dataset = make_article_cf_tensor_frame(num_rows)
-    data[ARTICLE_CF].tf = dataset.tensor_frame
-    data[ARTICLE_CF].time = torch.from_numpy(
-        to_unix_time(pd.Series([seed_time] * num_rows, dtype="datetime64[ns]"))
-    )
 
     src = torch.from_numpy(snapshot["src_article_id"].to_numpy(dtype=np.int64)).long()
     dst = torch.from_numpy(snapshot["dst_article_id"].to_numpy(dtype=np.int64)).long()
-    data[CF_SRC_F2P].edge_index = sort_edge_index(torch.stack([cf_ids, src], dim=0))
-    data[CF_SRC_REV].edge_index = sort_edge_index(torch.stack([src, cf_ids], dim=0))
-    data[CF_DST_F2P].edge_index = sort_edge_index(torch.stack([cf_ids, dst], dim=0))
-    data[CF_DST_REV].edge_index = sort_edge_index(torch.stack([dst, cf_ids], dim=0))
+    data[CF_SRC_TO_DST].edge_index = sort_edge_index(torch.stack([src, dst], dim=0))
+    data[CF_DST_TO_SRC].edge_index = sort_edge_index(torch.stack([dst, src], dim=0))
     data.validate()
     return data
 
 
 def build_cf_schema_template(base_data: HeteroData) -> HeteroData:
-    """Build a reusable model schema containing CF node and edge types."""
+    """Build a reusable model schema containing direct CF edge types."""
     empty = pd.DataFrame(
         {
             "seed_time": pd.Series([], dtype="datetime64[ns]"),
@@ -98,9 +70,9 @@ def build_cf_num_neighbors(
     num_layers: int,
     num_neighbors: int,
 ) -> Dict[EdgeType, list[int]]:
-    """Build direction-preserving fanouts for the CF expansion route."""
-    if num_layers < 4:
-        raise ValueError("CF augmentation requires num_layers >= 4.")
+    """Build direction-preserving fanouts for direct article-CF expansion."""
+    if num_layers < 3:
+        raise ValueError("CF augmentation requires num_layers >= 3.")
     hop_fanouts = [int(num_neighbors // 2**i) for i in range(num_layers)]
     out: Dict[EdgeType, list[int]] = {
         edge_type: list(hop_fanouts) for edge_type in edge_types
@@ -108,6 +80,5 @@ def build_cf_num_neighbors(
     zeros = [0 for _ in range(num_layers)]
     for edge_type in CF_EDGE_TYPES:
         out[edge_type] = list(zeros)
-    out[CF_SRC_F2P][2] = hop_fanouts[2]
-    out[CF_DST_REV][3] = hop_fanouts[3]
+    out[CF_DST_TO_SRC][2] = hop_fanouts[2]
     return out

@@ -7,7 +7,7 @@
 - **Initial supported task:** `user-item-purchase`
 - **Primary baseline:** `examples/idgnn_recommendation.py`
 - **Implementation style:** add a separate experimental pipeline; preserve the behavior of the existing baseline.
-- **Main objective:** augment each seed-time-specific RDL graph with a temporal `article_cf` fact table so that ID-GNN can reach collaborative-filtering candidates through a four-hop path.
+- **Main objective:** augment each seed-time-specific RDL graph with direct article-article collaborative-filtering edges so that ID-GNN can reach CF candidates without an intermediate snapshot-table node.
 
 The implementation must follow the current checkout rather than relying blindly on line numbers in this specification.
 
@@ -17,27 +17,25 @@ The implementation must follow the current checkout rather than relying blindly 
 
 The current RelBench ID-GNN recommendation example samples a temporal source-centered subgraph and scores destination `article` nodes that appear in that subgraph. Its performance is therefore upper-bounded by candidate coverage.
 
-For `rel-hm/user-item-purchase`, add a seed-time-specific collaborative-filtering fact table:
+For `rel-hm/user-item-purchase`, add seed-time-specific direct collaborative-filtering edges:
 
 ```text
 customer
   <- transactions
   <- article (historically purchased source item)
-  <- article_cf
   <- article (CF destination candidate)
 ```
 
-Equivalently, under the RelBench foreign-key edge convention and incoming-neighbor sampling, the intended four-hop candidate expansion is:
+Under incoming-neighbor sampling, the intended three-hop candidate expansion is:
 
 ```text
 customer
   <-[transactions.f2p_customer_id]- transactions
   <-[article.rev_f2p_article_id]- article(src)
-  <-[article_cf.f2p_src_article_id]- article_cf
-  <-[article.rev_f2p_dst_article_id]- article(dst)
+  <-[article.rev_cf_src_to_dst_article_id]- article(dst)
 ```
 
-The `article_cf` table must be computed independently for every task seed time. Only the exact snapshot for a seed time may be present in the graph used for samples at that seed time.
+The CF snapshot table must still be computed independently for every task seed time and persisted for validation/analysis. At runtime, snapshot rows become direct article-article edges only. Only the exact snapshot for a seed time may be present in the graph used for samples at that seed time.
 
 ---
 
@@ -214,21 +212,13 @@ Reasons:
 
 ### 3.8 Model input
 
-Store `support`, `cf_score`, and `rank` for preprocessing, validation, and analysis, but do not feed them to the model.
-
-The graph-facing `article_cf` node input must contain only a constant feature:
-
-```text
-__const__ = 1.0
-```
+Store `support`, `cf_score`, and `rank` for preprocessing, validation, and analysis, but do not feed them to the model. Snapshot rows must not create an `article_cf` node, node feature, or edge feature.
 
 The model must not receive:
 
 - `cf_score`
 - `support`
 - `rank`
-
-The `article_cf` node timestamp is the snapshot seed time.
 
 ### 3.9 Sampling
 
@@ -506,48 +496,28 @@ Do not add `psutil` solely for logging.
 
 ### 7.1 Node type
 
-Add node type:
-
-```text
-article_cf
-```
-
-Each parquet row becomes one `article_cf` node.
-
-For a snapshot with \(N\) rows:
-
-```text
-article_cf node IDs = [0, N)
-```
-
-Each node has:
-
-```text
-time = seed_time
-TensorFrame feature: __const__ = 1.0
-```
+Do not add a CF snapshot node type. `article_cf` must not appear in the
+runtime graph. Each parquet row becomes direct article-article CF edges.
 
 ### 7.2 Edge types
 
-Use names consistent with `make_pkey_fkey_graph`:
+Use explicit direct CF edge types:
 
 ```python
-CF_SRC_F2P = ("article_cf", "f2p_src_article_id", "article")
-CF_SRC_REV = ("article", "rev_f2p_src_article_id", "article_cf")
-CF_DST_F2P = ("article_cf", "f2p_dst_article_id", "article")
-CF_DST_REV = ("article", "rev_f2p_dst_article_id", "article_cf")
+CF_SRC_TO_DST = ("article", "cf_src_to_dst_article_id", "article")
+CF_DST_TO_SRC = ("article", "rev_cf_src_to_dst_article_id", "article")
 ```
 
 Construct:
 
 ```text
-article_cf -> src article
-src article -> article_cf
-article_cf -> dst article
-dst article -> article_cf
+src article -> dst article
+dst article -> src article
 ```
 
-Use `torch.long` edge indices and `sort_edge_index`.
+Use `torch.long` edge indices and `sort_edge_index`. `CF_DST_TO_SRC` is the
+incoming-sampling expansion route from a historical source article to a CF
+destination candidate.
 
 Validate that source and destination article IDs are within the article-node range.
 
@@ -561,7 +531,8 @@ cf_snapshot_<t>.parquet
 
 Do not concatenate previous snapshots.
 
-Do not rely on `cf_node.time <= seed_time` to select the correct version. Temporal loading would otherwise accumulate stale rows from older snapshots.
+Do not concatenate snapshots. Direct CF edges have no separate timestamp carrier,
+so exact snapshot isolation is mandatory.
 
 ### 7.4 Base graph reuse
 
@@ -570,7 +541,7 @@ Build the original RelBench graph once with `make_pkey_fkey_graph`.
 For each seed time:
 
 1. shallow-copy the `HeteroData` container without cloning all base tensors
-2. attach/replace only the `article_cf` node store and four CF edge stores
+2. attach/replace only the direct article-article CF edge stores
 3. do not mutate the original base graph
 4. delete references to the snapshot graph and loader after the group is processed
 
@@ -588,31 +559,24 @@ A unit test must prove that attaching a snapshot does not mutate the base graph.
 
 ### 7.5 Model schema template
 
-`Model` is initialized once, but snapshot node counts vary.
+`Model` is initialized once, while direct CF edge counts vary by snapshot.
 
 Build a schema template that contains:
 
 - all base node/edge types
-- node type `article_cf`
-- the four CF edge types
-- a constant-feature TensorFrame for `article_cf`
+- the direct CF edge types
 - empty CF edge indices
 
 The model schema must be identical to every actual snapshot graph.
 
-Generate `col_stats_dict["article_cf"]` once from the constant feature and reuse it.
-
-Do not add `article_cf` to `shallow_list`.
+Do not add `article_cf` to the model schema, `col_stats_dict`, or `shallow_list`.
 
 ### 7.6 Empty snapshot
 
 If a snapshot produces zero valid CF rows:
 
-- preserve the `article_cf` node type and all four edge types
+- preserve the direct CF edge types
 - use empty edge indices
-- use a safe featureless-node representation supported by the installed PyTorch Frame version
-- if a zero-row TensorFrame is not supported, use one isolated dummy node with no incident edges
-- the dummy node must never become a candidate or affect reachability
 - log that the snapshot has zero real CF rows
 
 ---
@@ -622,7 +586,7 @@ If a snapshot produces zero valid CF rows:
 Although every CF row has two article foreign keys, candidate expansion must follow:
 
 ```text
-historical src article -> article_cf -> dst article
+historical src article -> dst article
 ```
 
 It must not automatically treat `dst -> src` as the same candidate-generation route.
@@ -638,7 +602,7 @@ hop_fanouts = [
 ]
 ```
 
-For the initial four-layer setup, expected default fanouts are:
+For the default four-layer setup, expected base-edge fanouts are:
 
 ```text
 [128, 64, 32, 16]
@@ -646,31 +610,27 @@ For the initial four-layer setup, expected default fanouts are:
 
 Requirements:
 
-- require `num_layers >= 4` when CF augmentation is enabled
+- require `num_layers >= 3` when CF augmentation is enabled
 - retain the standard fanout list for original base edge types
 - set all CF edge-type fanouts to zero by default
-- enable only:
-  - `CF_SRC_F2P` at hop index 2
-  - `CF_DST_REV` at hop index 3
-- leave `CF_DST_F2P` and `CF_SRC_REV` disabled for expansion
+- enable only `CF_DST_TO_SRC` at hop index 2
+- leave `CF_SRC_TO_DST` disabled for expansion
 - keep `subgraph_type="bidirectional"` as in the baseline for message passing after sampling
 
 Conceptually:
 
 ```python
-num_neighbors[CF_SRC_F2P] = [0, 0, hop_fanouts[2], 0]
-num_neighbors[CF_DST_REV] = [0, 0, 0, hop_fanouts[3]]
-num_neighbors[CF_DST_F2P] = [0, 0, 0, 0]
-num_neighbors[CF_SRC_REV] = [0, 0, 0, 0]
+num_neighbors[CF_SRC_TO_DST] = [0, 0, 0, 0]
+num_neighbors[CF_DST_TO_SRC] = [0, 0, hop_fanouts[2], 0]
 ```
 
-Generalize carefully if more than four layers are allowed; the intended CF expansion remains on hops 3 and 4.
+Generalize carefully if more than four layers are allowed; the intended direct
+CF expansion remains on hop 3.
 
 A toy integration test must verify that:
 
 - a customer seed reaches a historical source article
-- the source article reaches its CF row
-- the CF row reaches the destination article
+- the source article reaches the destination article through a direct CF edge
 - a row where the historical article appears only as `dst_article_id` does not create the reverse candidate route
 
 ---
@@ -803,7 +763,7 @@ examples/hm_cf/io.py
 examples/hm_cf/graph.py
 examples/hm_cf/seed_time_loader.py
 examples/build_hm_cf_snapshots.py
-examples/idgnn_recommendation_cf.py
+examples/idgnn_recommendation_hm_cf.py
 examples/hm_cf/README.md
 test/examples/test_hm_cf_snapshot.py
 test/examples/test_hm_cf_io.py
@@ -992,7 +952,7 @@ Behavior:
 Entry point:
 
 ```bash
-python -m examples.idgnn_recommendation_cf \
+python -m examples.idgnn_recommendation_hm_cf \
   --dataset rel-hm \
   --task user-item-purchase \
   --cf-snapshot-dir /data/seonghun/cf_snapshots/rel-hm/user-item-purchase/window_8w_alpha_0.5_support_3_top32 \
@@ -1036,7 +996,7 @@ Training must fail fast when:
 
 - the manifest is missing or incompatible
 - any required snapshot file is missing
-- `num_layers < 4`
+- `num_layers < 3`
 - graph schema differs across snapshots
 - snapshot IDs exceed article bounds
 
@@ -1092,7 +1052,7 @@ Verify dtypes, seed time, atomic path behavior, manifest compatibility, and resu
 
 ### 14.8 No-model-feature test
 
-After graph attachment, the `article_cf` TensorFrame exposes only `__const__`; it must not expose score, support, or rank.
+After graph attachment, no `article_cf` node exists, and CF snapshot columns are not exposed as node or edge features.
 
 ### 14.9 Base graph immutability test
 
@@ -1100,14 +1060,14 @@ Attaching one or more snapshots must not mutate base graph node stores or edge s
 
 ### 14.10 Graph edge-role test
 
-For a small snapshot, verify the exact four edge indices and their direction.
+For a small snapshot, verify the exact direct forward and reverse CF edge indices.
 
-### 14.11 Four-hop reachability integration test
+### 14.11 Direct reachability integration test
 
 Using a small temporal heterogeneous graph and `NeighborLoader`, verify:
 
 ```text
-customer -> past transaction -> src article -> CF node -> dst article
+customer -> past transaction -> src article -> dst article
 ```
 
 and verify that reverse top-L semantics are not introduced by the expansion configuration.
@@ -1148,7 +1108,7 @@ Implementation is complete only when all conditions below hold.
 - [ ] Ordered pairs are retained.
 - [ ] Exact seed-time snapshots are isolated.
 - [ ] CF score/support/rank are not model input.
-- [ ] The intended direction-preserving four-hop route works.
+- [ ] The intended direction-preserving direct CF route works.
 - [ ] Validation/test predictions preserve original row order.
 - [ ] Baseline `examples/idgnn_recommendation.py` behavior remains unchanged.
 
@@ -1201,7 +1161,7 @@ Run CLI help:
 
 ```bash
 python -m examples.build_hm_cf_snapshots --help
-python -m examples.idgnn_recommendation_cf --help
+python -m examples.idgnn_recommendation_hm_cf --help
 ```
 
 When Rel-HM data is available, run a one-snapshot pilot only:
@@ -1226,7 +1186,6 @@ Do not automatically launch the full 52-snapshot preprocessing or full GPU train
 
 Do not implement in this change:
 
-- direct article-article CF edges
 - recency-weighted user-item matrices
 - time-decayed CF
 - score-aware GNN input

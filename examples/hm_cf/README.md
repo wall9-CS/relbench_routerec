@@ -1,10 +1,11 @@
 # Rel-HM Seed-Time CF Snapshots
 
 This experimental pipeline augments `rel-hm/user-item-purchase` ID-GNN samples
-with one seed-time-specific `article_cf` fact table. Each snapshot uses binary
-customer-article interactions in `(seed_time - 8 weeks, seed_time]` by default,
-computes sparse `M.T @ M` with SciPy, stores support/score/rank for analysis,
-and exposes only a constant `__const__` feature to the model.
+with seed-time-specific direct article-article CF edges. Each snapshot uses
+binary customer-article interactions in `(seed_time - 8 weeks, seed_time]` by
+default, computes sparse `M.T @ M` with SciPy, and stores support/score/rank for
+analysis. At runtime, the snapshot rows are attached as direct edges only; no
+intermediate `article_cf` node or CF score feature is exposed to the model.
 
 Build all default train/val/test snapshots:
 
@@ -33,10 +34,10 @@ python -m examples.build_hm_cf_snapshots \
   --output-root /tmp/relbench_cf_pilot
 ```
 
-Train the CF-augmented four-layer ID-GNN:
+Train the CF-augmented ID-GNN:
 
 ```bash
-python -m examples.idgnn_recommendation_cf \
+python -m examples.idgnn_recommendation_hm_cf \
   --dataset rel-hm \
   --task user-item-purchase \
   --cf-snapshot-dir /data/seonghun/cf_snapshots/rel-hm/user-item-purchase/window_8w_alpha_0.5_support_3_top32 \
