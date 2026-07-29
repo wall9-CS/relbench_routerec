@@ -7,22 +7,22 @@
 - **Source entity:** `UserInfo`
 - **Destination entity:** `AdsInfo`
 - **Interaction table:** `VisitStream(UserID, AdID, ViewDate, ...)`
-- **Goal:** augment each seed-time-specific ID-GNN graph with an `ad_cf`
-  fact table so candidate ads can be reached through a four-hop route.
+- **Goal:** augment each seed-time-specific ID-GNN graph with direct
+  `AdsInfo`-to-`AdsInfo` CF edges so candidate ads can be reached without an
+  intermediate CF node.
 
 Rel-HM and Rel-Amazon code should remain compatible. Avito-specific code lives
-under `examples/avito_cf` and uses Avito names (`ad_cf`, `src_AdID`,
-`dst_AdID`) instead of article/product names.
+under `examples/avito_cf` and uses Avito names (`src_AdID`, `dst_AdID`)
+instead of article/product names.
 
 ## 1. Candidate Route
 
-For each seed time, attach exactly one `ad_cf` snapshot:
+For each seed time, attach exactly one direct ad-CF snapshot:
 
 ```text
 UserInfo
   <- VisitStream
   <- AdsInfo (historically visited source ad)
-  <- ad_cf
   <- AdsInfo (CF destination candidate)
 ```
 
@@ -32,11 +32,10 @@ Under RelBench foreign-key edge naming:
 UserInfo
   <-[VisitStream.f2p_UserID]- VisitStream
   <-[AdsInfo.rev_f2p_AdID]- AdsInfo(src)
-  <-[ad_cf.f2p_src_AdID]- ad_cf
-  <-[AdsInfo.rev_f2p_dst_AdID]- AdsInfo(dst)
+  <-[AdsInfo.rev_cf_src_to_dst_AdID]- AdsInfo(dst)
 ```
 
-Use `num_layers >= 4`. The default CF experiment uses `num_layers=4`.
+Use `num_layers >= 3`. The default CF experiment uses `num_layers=3`.
 
 ## 2. Interaction Semantics
 
@@ -118,13 +117,8 @@ Parquet schema:
 | `cf_score` | normalized CF score |
 | `rank` | one-based rank within source ad |
 
-The graph-facing `ad_cf` TensorFrame exposes only:
-
-```text
-__const__ = 1.0
-```
-
-`support`, `cf_score`, and `rank` are not model inputs.
+The graph-facing CF rows are attached as direct edge indices only. `support`,
+`cf_score`, and `rank` are not model inputs.
 
 ## 5. CLIs
 
@@ -149,7 +143,7 @@ python -m examples.evaluate_avito_cf_coverage \
   --task user-ad-visit \
   --cf-snapshot-dir /data/seonghun/cf_snapshots/rel-avito/user-ad-visit/window_4d_alpha_0.5_support_3_top32 \
   --splits val,test \
-  --num-layers 4
+  --num-layers 3
 ```
 
 Train CF-augmented ID-GNN:
@@ -159,7 +153,7 @@ python -m examples.idgnn_recommendation_avito_cf \
   --dataset rel-avito \
   --task user-ad-visit \
   --cf-snapshot-dir /data/seonghun/cf_snapshots/rel-avito/user-ad-visit/window_4d_alpha_0.5_support_3_top32 \
-  --num_layers 4 \
+  --num_layers 3 \
   --num_neighbors 128
 ```
 
@@ -172,8 +166,8 @@ Use synthetic data only. Cover:
 - binary user-ad interactions
 - ad snapshot validation
 - exact seed-time loading
-- `ad_cf` graph edge roles
-- four-hop fanout schedule
+- direct ad-CF graph edge roles
+- three-hop fanout schedule
 - coverage metrics for partial coverage
 
 ## 7. Acceptance Criteria
@@ -181,7 +175,7 @@ Use synthetic data only. Cover:
 - Rel-HM and Rel-Amazon tests remain compatible.
 - `rel-avito/user-ad-visit` is accepted by config validation.
 - Snapshots use `src_AdID` / `dst_AdID`.
-- The graph node type is `ad_cf`.
-- The model receives only `__const__` for `ad_cf`.
-- `num_layers < 4` fails for CF coverage/graph fanouts.
+- No `ad_cf` graph node type is attached.
+- The model receives no CF node features or CF score features.
+- `num_layers < 3` fails for CF coverage/graph fanouts.
 - Targeted tests pass.

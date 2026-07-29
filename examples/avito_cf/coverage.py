@@ -82,7 +82,7 @@ def compute_cf_coverage_for_split(
     *,
     config: AvitoCFSnapshotConfig,
     num_ads: int,
-    num_layers: int = 4,
+    num_layers: int = 3,
     include_source_ads: bool = False,
 ) -> AvitoCFCoverageMetrics:
     table = task.get_table(split, mask_input_cols=False)
@@ -106,11 +106,11 @@ def compute_cf_coverage_for_table(
     *,
     config: AvitoCFSnapshotConfig,
     num_ads: int,
-    num_layers: int = 4,
+    num_layers: int = 3,
     include_source_ads: bool = False,
 ) -> AvitoCFCoverageMetrics:
-    if num_layers < 4:
-        raise ValueError("Avito CF coverage requires num_layers >= 4.")
+    if num_layers < 3:
+        raise ValueError("Avito CF coverage requires num_layers >= 3.")
     _validate_inputs(table, task, interactions)
     interactions = _sort_interactions_once(interactions)
     times = interactions["ViewDate"].to_numpy(dtype="datetime64[ns]", copy=False)

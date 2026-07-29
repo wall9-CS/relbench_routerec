@@ -1,9 +1,11 @@
 # Rel-Avito Seed-Time Ad-CF Snapshots
 
 This experimental pipeline augments `rel-avito/user-ad-visit` ID-GNN samples
-with one seed-time-specific `ad_cf` fact table. Each snapshot uses binary
-user-ad visits in `(seed_time - 4 days, seed_time]` by default, computes sparse
-`M.T @ M`, and exposes only a constant `__const__` feature to the model.
+with seed-time-specific direct ad-ad CF edges. Each snapshot uses binary user-ad
+visits in `(seed_time - 4 days, seed_time]` by default, computes sparse
+`M.T @ M`, and stores support/score/rank for analysis. At runtime, the snapshot
+rows are attached as direct `AdsInfo` edges only; no intermediate `ad_cf` node
+or CF score feature is exposed to the model.
 
 Build snapshots:
 
@@ -26,16 +28,16 @@ python -m examples.evaluate_avito_cf_coverage \
   --task user-ad-visit \
   --cf-snapshot-dir /data/seonghun/cf_snapshots/rel-avito/user-ad-visit/window_4d_alpha_0.5_support_3_top32 \
   --splits val,test \
-  --num-layers 4
+  --num-layers 3
 ```
 
-Train the CF-augmented four-layer ID-GNN:
+Train the CF-augmented ID-GNN:
 
 ```bash
 python -m examples.idgnn_recommendation_avito_cf \
   --dataset rel-avito \
   --task user-ad-visit \
   --cf-snapshot-dir /data/seonghun/cf_snapshots/rel-avito/user-ad-visit/window_4d_alpha_0.5_support_3_top32 \
-  --num_layers 4 \
+  --num_layers 3 \
   --num_neighbors 128
 ```

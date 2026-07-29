@@ -33,7 +33,6 @@ from relbench.tasks import get_task
 
 from .avito_cf.coverage import compute_cf_coverage_for_split
 from .avito_cf.graph import (
-    ad_cf_col_stats,
     attach_cf_snapshot,
     build_cf_num_neighbors,
     build_cf_schema_template,
@@ -108,8 +107,8 @@ def _load_group_graph(base_data, snapshot_dir, group, config, num_ads):
 
 def main() -> None:
     args = parse_args()
-    if args.num_layers < 4:
-        raise ValueError("Avito CF augmentation requires --num_layers >= 4.")
+    if args.num_layers < 3:
+        raise ValueError("Avito CF augmentation requires --num_layers >= 3.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
@@ -155,7 +154,6 @@ def main() -> None:
         cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
     )
     schema_data = build_cf_schema_template(base_data)
-    col_stats_dict = {**col_stats_dict, "ad_cf": ad_cf_col_stats()}
     num_neighbors = build_cf_num_neighbors(
         schema_data.edge_types,
         num_layers=args.num_layers,

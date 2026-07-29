@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", type=str, default="user-ad-visit")
     parser.add_argument("--cf-snapshot-dir", type=Path, required=True)
     parser.add_argument("--splits", default="val,test")
-    parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument(
         "--include-source-ads",
         action="store_true",

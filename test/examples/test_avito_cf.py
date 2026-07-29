@@ -1,21 +1,20 @@
+import numpy as np
 import pandas as pd
 import pytest
 import torch
+from torch_frame import stype
+from torch_frame.data import Dataset
 from torch_geometric.data import HeteroData
 
 from examples.avito_cf.config import AvitoCFSnapshotConfig
 from examples.avito_cf.coverage import compute_cf_coverage_for_table
 from examples.avito_cf.graph import (
-    AD_CF,
-    CF_DST_F2P,
-    CF_DST_REV,
+    CF_DST_TO_SRC,
     CF_EDGE_TYPES,
-    CF_SRC_F2P,
-    CF_SRC_REV,
+    CF_SRC_TO_DST,
     attach_cf_snapshot,
     build_cf_num_neighbors,
     build_cf_schema_template,
-    make_ad_cf_tensor_frame,
 )
 from examples.avito_cf.interactions import filter_visit_interactions
 from examples.avito_cf.io import load_snapshot, write_snapshot_atomic
@@ -61,11 +60,16 @@ def _snapshot(seed="2020-03-05"):
     )
 
 
+def _const_tensor_frame(num_rows: int):
+    df = pd.DataFrame({"__const__": np.ones(num_rows, dtype=np.float32)})
+    return Dataset(df=df, col_to_stype={"__const__": stype.numerical}).materialize()
+
+
 def _base_graph(num_ads=4):
     data = HeteroData()
-    data["AdsInfo"].tf = make_ad_cf_tensor_frame(num_ads).tensor_frame
+    data["AdsInfo"].tf = _const_tensor_frame(num_ads).tensor_frame
     data["AdsInfo"].time = torch.zeros(num_ads, dtype=torch.long)
-    data["UserInfo"].tf = make_ad_cf_tensor_frame(1).tensor_frame
+    data["UserInfo"].tf = _const_tensor_frame(1).tensor_frame
     data["UserInfo"].time = torch.zeros(1, dtype=torch.long)
     return data
 
@@ -115,22 +119,20 @@ def test_avito_snapshot_window_and_columns(tmp_path):
     assert loaded["cf_score"].dtype == "float32"
 
 
-def test_ad_cf_graph_edges_and_fanouts():
+def test_direct_ad_cf_graph_edges_and_fanouts():
     data = attach_cf_snapshot(_base_graph(), _snapshot(), pd.Timestamp("2020-03-05"))
-    assert AD_CF in data.node_types
-    assert torch.equal(data[CF_SRC_F2P].edge_index, torch.tensor([[0, 1], [0, 2]]))
-    assert torch.equal(data[CF_SRC_REV].edge_index, torch.tensor([[0, 2], [0, 1]]))
-    assert torch.equal(data[CF_DST_F2P].edge_index, torch.tensor([[0, 1], [1, 0]]))
-    assert torch.equal(data[CF_DST_REV].edge_index, torch.tensor([[0, 1], [1, 0]]))
+    assert data.node_types == ["AdsInfo", "UserInfo"]
+    assert torch.equal(data[CF_SRC_TO_DST].edge_index, torch.tensor([[0, 2], [1, 0]]))
+    assert torch.equal(data[CF_DST_TO_SRC].edge_index, torch.tensor([[0, 1], [2, 0]]))
 
     template = build_cf_schema_template(_base_graph())
     for edge_type in CF_EDGE_TYPES:
         assert edge_type in template.edge_types
     fanouts = build_cf_num_neighbors(template.edge_types, num_layers=4, num_neighbors=128)
-    assert fanouts[CF_SRC_F2P] == [0, 0, 32, 0]
-    assert fanouts[CF_DST_REV] == [0, 0, 0, 16]
+    assert fanouts[CF_SRC_TO_DST] == [0, 0, 0, 0]
+    assert fanouts[CF_DST_TO_SRC] == [0, 0, 32, 0]
     with pytest.raises(ValueError, match="num_layers"):
-        build_cf_num_neighbors(template.edge_types, num_layers=3, num_neighbors=128)
+        build_cf_num_neighbors(template.edge_types, num_layers=2, num_neighbors=128)
 
 
 def test_avito_cf_coverage_metrics(tmp_path):
@@ -175,3 +177,34 @@ def test_avito_cf_coverage_metrics(tmp_path):
     assert metrics.coverage_rate == pytest.approx(2 / 3)
     assert metrics.hit_rate == 1.0
     assert metrics.achievable_map == pytest.approx(0.75)
+
+
+def test_avito_cf_coverage_num_layers_guard(tmp_path):
+    cfg = AvitoCFSnapshotConfig(min_support=1, top_l=10)
+    seed = pd.Timestamp("2020-03-05")
+    write_snapshot_atomic(
+        pd.DataFrame(
+            {
+                "seed_time": pd.Series([], dtype="datetime64[ns]"),
+                "src_AdID": pd.Series([], dtype="int64"),
+                "dst_AdID": pd.Series([], dtype="int64"),
+                "support": pd.Series([], dtype="int64"),
+                "cf_score": pd.Series([], dtype="float32"),
+                "rank": pd.Series([], dtype="int32"),
+            }
+        ),
+        tmp_path,
+        seed,
+        config=cfg,
+        num_ads=3,
+    )
+    with pytest.raises(ValueError, match="num_layers"):
+        compute_cf_coverage_for_table(
+            _table([("2020-03-05", 0, [1])]),
+            DummyTask(),
+            filter_visit_interactions(_visits([(0, 1, "2020-03-04")])),
+            tmp_path,
+            config=cfg,
+            num_ads=3,
+            num_layers=2,
+        )
