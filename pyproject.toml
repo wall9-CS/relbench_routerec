@@ -34,6 +34,7 @@ example=[
 	"sentence-transformers",
 	"pytorch_frame[full]",
 	"torch_geometric",
+	"scipy",
 	"tqdm",
 ]
 test=[

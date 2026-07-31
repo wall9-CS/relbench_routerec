@@ -1,0 +1,18 @@
+{
+  "all_history": false,
+  "alpha": 0.5,
+  "binary_interactions": true,
+  "cf_node_type": "product_cf",
+  "customer_scope": "all_database_customers",
+  "dataset": "rel-amazon",
+  "dst_entity_table": "product",
+  "history_days": 91,
+  "interaction_table": "review",
+  "min_support": 3,
+  "score_used_as_model_input": false,
+  "snapshot_files": {},
+  "src_entity_table": "customer",
+  "task": "user-item-purchase",
+  "top_l": 32,
+  "window_boundary": "(seed_time - history_days, seed_time]"
+}
