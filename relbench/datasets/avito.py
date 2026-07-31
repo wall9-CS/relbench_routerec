@@ -1,10 +1,68 @@
 import os
 
+import numpy as np
 import pandas as pd
 import pooch
 
 from relbench.base import Database, Dataset, Table
 from relbench.utils import clean_datetime, unzip_processor
+
+
+def _make_similar_category_location_price_ad_df(
+    ads_info_df: pd.DataFrame,
+    num_price_neighbors: int = 1,
+) -> pd.DataFrame:
+    if num_price_neighbors < 1:
+        raise ValueError("num_price_neighbors must be positive.")
+
+    required_cols = ["AdID", "CategoryID", "LocationID", "Price"]
+    ads_df = ads_info_df[required_cols].copy()
+    ads_df["Price"] = pd.to_numeric(ads_df["Price"], errors="coerce")
+    ads_df = ads_df.dropna(subset=required_cols)
+    if ads_df.empty:
+        return pd.DataFrame(columns=["AdID_left", "AdID_right"])
+
+    price = ads_df["Price"].clip(lower=0)
+    ads_df["price_bin"] = np.floor(np.log1p(price)).astype("int16")
+    ads_df = ads_df.sort_values(
+        ["CategoryID", "LocationID", "price_bin", "Price", "AdID"],
+        kind="mergesort",
+    )
+
+    left_chunks = []
+    right_chunks = []
+    for _, group in ads_df.groupby(
+        ["CategoryID", "LocationID", "price_bin"],
+        sort=False,
+        observed=True,
+    ):
+        ad_ids = group["AdID"].to_numpy()
+        max_offset = min(num_price_neighbors, len(ad_ids) - 1)
+        for offset in range(1, max_offset + 1):
+            left_chunks.append(ad_ids[:-offset])
+            right_chunks.append(ad_ids[offset:])
+
+    if not left_chunks:
+        return pd.DataFrame(columns=["AdID_left", "AdID_right"])
+
+    return pd.DataFrame(
+        {
+            "AdID_left": np.concatenate(left_chunks),
+            "AdID_right": np.concatenate(right_chunks),
+        }
+    )
+
+
+def _similar_category_location_price_ad_table(ads_info_df: pd.DataFrame) -> Table:
+    return Table(
+        df=_make_similar_category_location_price_ad_df(ads_info_df),
+        fkey_col_to_pkey_table={
+            "AdID_left": "AdsInfo",
+            "AdID_right": "AdsInfo",
+        },
+        pkey_col=None,
+        time_col=None,
+    )
 
 
 class AvitoDataset(Dataset):
@@ -127,8 +185,21 @@ class AvitoDataset(Dataset):
             },
             time_col="ViewDate",
         )
+        tables["similar_category_location_price_ad"] = (
+            _similar_category_location_price_ad_table(ads_info_df)
+        )
         db = Database(tables)
 
         db = db.from_(pd.Timestamp("2015-04-25"))
 
+        return db
+
+    def get_db(self, upto_test_timestamp=True) -> Database:
+        db = super().get_db(upto_test_timestamp=upto_test_timestamp)
+        if "similar_category_location_price_ad" not in db.table_dict:
+            db.table_dict["similar_category_location_price_ad"] = (
+                _similar_category_location_price_ad_table(
+                    db.table_dict["AdsInfo"].df
+                )
+            )
         return db
