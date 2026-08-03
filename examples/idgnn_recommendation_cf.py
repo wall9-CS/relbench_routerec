@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--cache_dir", type=str, default=os.path.expanduser("~/.cache/relbench_examples")
+        "--cache_dir", type=str, default=os.path.expanduser("/data/.cache/relbench_examples")
     )
     parser.add_argument("--cf-snapshot-dir", type=Path, required=True)
     parser.add_argument(
