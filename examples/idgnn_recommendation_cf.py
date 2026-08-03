@@ -25,7 +25,7 @@ except ImportError:
     from model import Model
     from text_embedder import GloveTextEmbedding
 
-from relbench.base import Dataset, RecommendationTask, TaskType
+from relbench.base import Database, Dataset, RecommendationTask, TaskType
 from relbench.datasets import get_dataset
 from relbench.modeling.graph import make_pkey_fkey_graph
 from relbench.modeling.loader import SparseTensor
@@ -45,6 +45,15 @@ from .hm_cf.seed_time_loader import (
     group_recommendation_table_by_seed_time,
     make_seed_time_loader,
     scatter_group_predictions,
+)
+
+
+SAME_PRODUCT_CODE_TABLE = "same_product_code"
+SAME_PRODUCT_CODE_EDGE_TYPES = (
+    (SAME_PRODUCT_CODE_TABLE, "f2p_article_id_left", "article"),
+    ("article", "rev_f2p_article_id_left", SAME_PRODUCT_CODE_TABLE),
+    (SAME_PRODUCT_CODE_TABLE, "f2p_article_id_right", "article"),
+    ("article", "rev_f2p_article_id_right", SAME_PRODUCT_CODE_TABLE),
 )
 
 
@@ -70,24 +79,78 @@ def parse_args() -> argparse.Namespace:
         "--cache_dir", type=str, default=os.path.expanduser("~/.cache/relbench_examples")
     )
     parser.add_argument("--cf-snapshot-dir", type=Path, required=True)
+    parser.add_argument(
+        "--use-same-product-code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the rel-hm same_product_code table alongside CF snapshots. "
+            "Enabled by default; pass --no-use-same-product-code for ablations."
+        ),
+    )
     parser.add_argument("--report-cf-coverage", action="store_true")
     return parser.parse_args()
 
 
-def _load_stypes(dataset: Dataset, args: argparse.Namespace) -> dict:
+def _convert_stypes(col_to_stype_dict: dict) -> dict:
+    for _, col_to_stype in col_to_stype_dict.items():
+        for col, stype_str in col_to_stype.items():
+            col_to_stype[col] = stype(stype_str)
+    return col_to_stype_dict
+
+
+def _stypes_cache_matches_db(col_to_stype_dict: dict, db: Database) -> bool:
+    if set(col_to_stype_dict.keys()) != set(db.table_dict.keys()):
+        return False
+    for table_name, table in db.table_dict.items():
+        if set(col_to_stype_dict[table_name].keys()) != set(table.df.columns):
+            return False
+    return True
+
+
+def _load_stypes(db: Database, args: argparse.Namespace) -> dict:
     stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
     try:
         with open(stypes_cache_path, "r", encoding="utf-8") as f:
-            col_to_stype_dict = json.load(f)
-        for _, col_to_stype in col_to_stype_dict.items():
-            for col, stype_str in col_to_stype.items():
-                col_to_stype[col] = stype(stype_str)
+            col_to_stype_dict = _convert_stypes(json.load(f))
+        if not _stypes_cache_matches_db(col_to_stype_dict, db):
+            col_to_stype_dict = get_stype_proposal(db)
+            stypes_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(stypes_cache_path, "w", encoding="utf-8") as f:
+                json.dump(col_to_stype_dict, f, indent=2, default=str)
     except FileNotFoundError:
-        col_to_stype_dict = get_stype_proposal(dataset.get_db())
+        col_to_stype_dict = get_stype_proposal(db)
         stypes_cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(stypes_cache_path, "w", encoding="utf-8") as f:
             json.dump(col_to_stype_dict, f, indent=2, default=str)
     return col_to_stype_dict
+
+
+def _drop_same_product_code_table(db: Database) -> Database:
+    table_dict = {
+        table_name: table
+        for table_name, table in db.table_dict.items()
+        if table_name != SAME_PRODUCT_CODE_TABLE
+    }
+    return Database(table_dict=table_dict)
+
+
+def _require_same_product_code_graph(data, db: Database) -> None:
+    if SAME_PRODUCT_CODE_TABLE not in db.table_dict:
+        raise ValueError(
+            "The rel-hm database does not contain the same_product_code table. "
+            "Regenerate or reload the dataset with the current relbench.datasets.hm code."
+        )
+    missing = [
+        edge_type
+        for edge_type in SAME_PRODUCT_CODE_EDGE_TYPES
+        if edge_type not in data.edge_types
+    ]
+    if missing:
+        raise ValueError(
+            "same_product_code table was loaded, but the graph is missing edge "
+            f"types: {missing}"
+        )
 
 
 def _load_group_graph(base_data, snapshot_dir, group, config, num_articles):
@@ -130,6 +193,14 @@ def main() -> None:
     assert task.task_type == TaskType.LINK_PREDICTION
     num_articles = task.num_dst_nodes
     db = dataset.get_db()
+    if args.use_same_product_code:
+        if args.dataset != "rel-hm" or args.task != "user-item-purchase":
+            raise ValueError(
+                "--use-same-product-code is only supported for "
+                "rel-hm/user-item-purchase."
+            )
+    else:
+        db = _drop_same_product_code_table(db)
 
     if args.report_cf_coverage:
         transactions = db.table_dict["transactions"].df
@@ -145,7 +216,7 @@ def main() -> None:
             )
             print(f"CF coverage {split}: {metrics.to_dict()}")
 
-    col_to_stype_dict = _load_stypes(dataset, args)
+    col_to_stype_dict = _load_stypes(db, args)
     base_data, col_stats_dict = make_pkey_fkey_graph(
         db,
         col_to_stype_dict=col_to_stype_dict,
@@ -154,6 +225,12 @@ def main() -> None:
         ),
         cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
     )
+    if args.use_same_product_code:
+        _require_same_product_code_graph(base_data, db)
+        print(
+            "Using same_product_code table with "
+            f"{len(db.table_dict[SAME_PRODUCT_CODE_TABLE])} article-pair rows."
+        )
     schema_data = build_cf_schema_template(base_data)
     col_stats_dict = {**col_stats_dict, "article_cf": article_cf_col_stats()}
     num_neighbors = build_cf_num_neighbors(

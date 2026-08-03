@@ -3,10 +3,16 @@ import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
+from torch_frame import stype
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.typing import WITH_PYG_LIB
 
+from examples.idgnn_recommendation_cf import (
+    SAME_PRODUCT_CODE_EDGE_TYPES,
+    _require_same_product_code_graph,
+    _stypes_cache_matches_db,
+)
 from examples.model import Model
 from examples.hm_cf.graph import (
     ARTICLE_CF,
@@ -21,6 +27,7 @@ from examples.hm_cf.graph import (
     build_cf_schema_template,
     make_article_cf_tensor_frame,
 )
+from relbench.base import Database, Table
 from relbench.modeling.utils import to_unix_time
 
 
@@ -102,6 +109,62 @@ def test_schema_template_and_fanouts():
     assert fanouts[CF_SRC_REV] == [0, 0, 0, 0]
     with pytest.raises(ValueError, match="num_layers"):
         build_cf_num_neighbors(template.edge_types, num_layers=3, num_neighbors=128)
+
+
+def test_stypes_cache_validation_detects_same_product_code_schema_change():
+    db = Database(
+        table_dict={
+            "article": Table(
+                pd.DataFrame({"article_id": [0], "product_code": [10]}),
+                fkey_col_to_pkey_table={},
+                pkey_col="article_id",
+            ),
+            "same_product_code": Table(
+                pd.DataFrame({"article_id_left": [0], "article_id_right": [0]}),
+                fkey_col_to_pkey_table={
+                    "article_id_left": "article",
+                    "article_id_right": "article",
+                },
+            ),
+        }
+    )
+    matching = {
+        "article": {"article_id": stype.numerical, "product_code": stype.numerical},
+        "same_product_code": {
+            "article_id_left": stype.numerical,
+            "article_id_right": stype.numerical,
+        },
+    }
+    stale = {"article": {"article_id": stype.numerical, "product_code": stype.numerical}}
+
+    assert _stypes_cache_matches_db(matching, db)
+    assert not _stypes_cache_matches_db(stale, db)
+
+
+def test_same_product_code_graph_requirement_is_explicit():
+    db = Database(
+        table_dict={
+            "same_product_code": Table(
+                pd.DataFrame({"article_id_left": [], "article_id_right": []}),
+                fkey_col_to_pkey_table={
+                    "article_id_left": "article",
+                    "article_id_right": "article",
+                },
+            )
+        }
+    )
+    data = HeteroData()
+    for edge_type in SAME_PRODUCT_CODE_EDGE_TYPES:
+        data[edge_type].edge_index = torch.empty((2, 0), dtype=torch.long)
+
+    _require_same_product_code_graph(data, db)
+
+    missing_edge_data = HeteroData()
+    with pytest.raises(ValueError, match="missing edge types"):
+        _require_same_product_code_graph(missing_edge_data, db)
+
+    with pytest.raises(ValueError, match="does not contain"):
+        _require_same_product_code_graph(HeteroData(), Database(table_dict={}))
 
 
 def test_seed_time_isolation_by_exact_attachment():
