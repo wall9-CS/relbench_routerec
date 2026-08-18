@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache_dir",
         type=str,
-        default=os.path.expanduser("/data/.cache/relbench_examples"),
+        default=os.path.expanduser("/data/seonghun/.cache/relbench_examples"),
     )
     parser.add_argument("--cf-snapshot-dir", type=Path, required=True)
     parser.add_argument("--report-cf-coverage", action="store_true")
