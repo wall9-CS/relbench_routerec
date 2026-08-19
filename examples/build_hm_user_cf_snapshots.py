@@ -1,0 +1,137 @@
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+
+import pandas as pd
+
+from relbench.datasets import get_dataset
+from relbench.tasks import get_task
+
+from .hm_user_cf.config import UserCFSnapshotConfig, snapshot_filename
+from .hm_user_cf.io import (
+    discover_seed_times,
+    initialize_or_load_manifest,
+    load_snapshot,
+    manifest_key,
+    parse_seed_times,
+    source_customers_by_seed_time,
+    write_manifest_atomic,
+    write_snapshot_atomic,
+)
+from .hm_user_cf.snapshot import build_snapshot
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build seed-time-specific Rel-HM user-CF parquet snapshots."
+    )
+    parser.add_argument("--dataset", default="rel-hm")
+    parser.add_argument("--task", default="user-item-purchase")
+    parser.add_argument("--window-weeks", type=int, default=None)
+    parser.add_argument("--all-history", action="store_true")
+    parser.add_argument("--min-overlap", type=int, default=2)
+    parser.add_argument("--top-k", type=int, default=32)
+    parser.add_argument("--alpha", type=float, default=0.5)
+    parser.add_argument("--source-chunk-size", type=int, default=4096)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--splits", default="train,val,test")
+    parser.add_argument("--seed-time", action="append", default=None)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.all_history and args.window_weeks is not None:
+        raise SystemExit("--window-weeks and --all-history are mutually exclusive.")
+    window_weeks = None if args.all_history else (args.window_weeks or 8)
+    config = UserCFSnapshotConfig(
+        dataset=args.dataset,
+        task=args.task,
+        window_weeks=window_weeks,
+        all_history=args.all_history,
+        min_overlap=args.min_overlap,
+        top_k=args.top_k,
+        alpha=args.alpha,
+    )
+    snapshot_dir = config.snapshot_dir(args.output_root)
+    manifest = initialize_or_load_manifest(snapshot_dir, config)
+
+    dataset = get_dataset(args.dataset, download=args.download)
+    task = get_task(args.dataset, args.task, download=args.download)
+    splits = [split.strip() for split in args.splits.split(",") if split.strip()]
+    seed_times = parse_seed_times(args.seed_time)
+    source_map = source_customers_by_seed_time(task, splits)
+    if seed_times is None:
+        seed_times = discover_seed_times(task, splits)
+
+    db = dataset.get_db()
+    transactions = db.table_dict["transactions"].df.sort_values(
+        "t_dat", kind="mergesort"
+    ).reset_index(drop=True)
+    num_customers = len(db.table_dict["customer"])
+    num_articles = len(db.table_dict["article"])
+
+    print(f"Writing user-CF snapshots to {snapshot_dir}")
+    for seed_time in seed_times:
+        key = manifest_key(seed_time)
+        final_path = snapshot_dir / snapshot_filename(seed_time)
+        sources = source_map.get(pd.Timestamp(seed_time), [])
+        if final_path.exists() and not args.overwrite:
+            try:
+                load_snapshot(
+                    snapshot_dir,
+                    seed_time,
+                    validate=True,
+                    config=config,
+                    num_customers=num_customers,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Existing user-CF snapshot for {seed_time} is invalid. "
+                    "Rerun with --overwrite to regenerate it."
+                ) from exc
+            print(f"Skipping valid existing snapshot for {seed_time}: {final_path}")
+            continue
+
+        df, stats = build_snapshot(
+            transactions,
+            seed_time,
+            num_customers,
+            num_articles,
+            sources,
+            config,
+            source_chunk_size=args.source_chunk_size,
+        )
+        path = write_snapshot_atomic(
+            df,
+            snapshot_dir,
+            seed_time,
+            config=config,
+            num_customers=num_customers,
+        )
+        file_size = os.path.getsize(path)
+        manifest["snapshot_files"][key] = stats.to_manifest_entry(
+            file=path.name,
+            file_size_bytes=file_size,
+        )
+        write_manifest_atomic(snapshot_dir, manifest)
+        print(
+            f"{pd.Timestamp(seed_time)}: rows={len(df)} "
+            f"sources={stats.num_source_customers} "
+            f"sources_with_history={stats.num_source_customers_with_history} "
+            f"active_customers={stats.num_active_customers} "
+            f"unique_pairs={stats.num_unique_user_item_pairs} "
+            f"overlap_nnz={stats.overlap_nnz_before_filter} "
+            f"elapsed={stats.elapsed_seconds:.2f}s file={path}"
+        )
+
+    print(snapshot_dir)
+
+
+if __name__ == "__main__":
+    main()
+
