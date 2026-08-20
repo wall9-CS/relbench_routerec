@@ -8,29 +8,58 @@ from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
+import torch
+from torch_geometric.data import HeteroData
+from torch_geometric.utils import sort_edge_index
 
 from relbench.base import RecommendationTask, Table
 from relbench.datasets import get_dataset
+from relbench.modeling.utils import to_unix_time
 from relbench.tasks import get_task
 
-from .avito_cf.coverage import compute_cf_coverage_for_split as compute_avito_item_cf
-from .avito_cf.interactions import filter_visit_interactions
-from .avito_cf.io import validate_manifest_for_training as validate_avito_item_cf
-from .avito_user_cf.coverage import (
-    compute_user_cf_coverage_for_split as compute_avito_user_cf,
+from .avito_cf.graph import (
+    attach_cf_snapshot as attach_avito_item_cf_snapshot,
+    build_cf_num_neighbors as build_avito_item_cf_num_neighbors,
 )
+from .avito_cf.interactions import filter_visit_interactions
+from .avito_cf.io import load_snapshot as load_avito_item_cf_snapshot
+from .avito_cf.io import validate_manifest_for_training as validate_avito_item_cf
+from .avito_user_cf.graph import (
+    attach_user_cf_snapshot as attach_avito_user_cf_snapshot,
+    build_user_cf_num_neighbors as build_avito_user_cf_num_neighbors,
+)
+from .avito_user_cf.io import load_snapshot as load_avito_user_cf_snapshot
 from .avito_user_cf.io import validate_manifest_for_training as validate_avito_user_cf
-from .hm_cf.coverage import compute_cf_coverage_for_split as compute_hm_item_cf
+from .hm_cf.graph import (
+    attach_cf_snapshot as attach_hm_item_cf_snapshot,
+    build_cf_num_neighbors as build_hm_item_cf_num_neighbors,
+)
+from .hm_cf.io import load_snapshot as load_hm_item_cf_snapshot
 from .hm_cf.io import validate_manifest_for_training as validate_hm_item_cf
-from .hm_cf.seed_time_loader import group_recommendation_table_by_seed_time
-from .hm_user_cf.coverage import compute_user_cf_coverage_for_split as compute_hm_user_cf
+from .hm_cf.seed_time_loader import (
+    group_recommendation_table_by_seed_time,
+    make_seed_time_loader,
+)
+from .hm_user_cf.graph import (
+    attach_user_cf_snapshot as attach_hm_user_cf_snapshot,
+    build_user_cf_num_neighbors as build_hm_user_cf_num_neighbors,
+)
+from .hm_user_cf.io import load_snapshot as load_hm_user_cf_snapshot
 from .hm_user_cf.io import validate_manifest_for_training as validate_hm_user_cf
-from .stack_cf.coverage import compute_cf_coverage_for_split as compute_stack_item_cf
+from .stack_cf.graph import (
+    attach_cf_snapshot as attach_stack_item_cf_snapshot,
+    build_cf_num_neighbors as build_stack_item_cf_num_neighbors,
+)
 from .stack_cf.interactions import filter_comment_interactions
+from .stack_cf.io import load_snapshot as load_stack_item_cf_snapshot
 from .stack_cf.io import validate_manifest_for_training as validate_stack_item_cf
 from .trial_cf.config import TrialCFSnapshotConfig
-from .trial_cf.coverage import compute_cf_coverage_for_split as compute_trial_route_cf
+from .trial_cf.graph import (
+    attach_cf_snapshot as attach_trial_cf_snapshot,
+    build_cf_num_neighbors as build_trial_cf_num_neighbors,
+)
 from .trial_cf.interactions import build_source_sponsor_interactions
+from .trial_cf.io import load_snapshot as load_trial_cf_snapshot
 from .trial_cf.io import validate_manifest_for_training as validate_trial_route_cf
 
 
@@ -40,6 +69,7 @@ class CoverageMetrics:
     num_positive_rows: int
     num_rows_with_candidates: int
     num_rows_with_hit: int
+    num_sampled_candidates: int
     num_groundtruth_labels: int
     num_covered_groundtruth_labels: int
     achievable_ap_sum: float
@@ -69,12 +99,29 @@ class CoverageMetrics:
             return float("nan")
         return 1.0 - value
 
+    @property
+    def sampled_candidate_precision(self) -> float:
+        if self.num_sampled_candidates == 0:
+            return float("nan")
+        return self.num_covered_groundtruth_labels / self.num_sampled_candidates
+
+    @property
+    def mean_sampled_candidates_per_positive_row(self) -> float:
+        if self.num_positive_rows == 0:
+            return float("nan")
+        return self.num_sampled_candidates / self.num_positive_rows
+
     def to_dict(self) -> dict[str, float | int]:
         out = asdict(self)
         out["coverage_rate"] = self.coverage_rate
+        out["sampled_subgraph_coverage_rate"] = self.coverage_rate
         out["hit_rate"] = self.hit_rate
         out["achievable_MAP"] = self.achievable_map
         out["coverage_gap"] = self.coverage_gap
+        out["sampled_candidate_precision"] = self.sampled_candidate_precision
+        out["mean_sampled_candidates_per_positive_row"] = (
+            self.mean_sampled_candidates_per_positive_row
+        )
         return out
 
 
@@ -147,7 +194,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-csv", type=Path)
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--num-neighbors", type=int, default=128)
+    parser.add_argument("--temporal-strategy", default="last")
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--base-num-layers", type=int, default=4)
     parser.add_argument("--item-cf-num-layers", type=int, default=4)
+    parser.add_argument("--user-cf-num-layers", type=int, default=4)
     parser.add_argument("--trial-cf-num-layers", type=int, default=2)
     return parser.parse_args()
 
@@ -168,23 +221,37 @@ def main() -> None:
         if not isinstance(task, RecommendationTask):
             raise TypeError(f"{spec.dataset}/{spec.task} is not a RecommendationTask.")
         db = dataset.get_db()
-        base_interactions = _base_interactions(spec, db)
+        base_graph = make_topology_graph(db)
+        base_num_neighbors = build_uniform_num_neighbors(
+            base_graph.edge_types,
+            num_layers=args.base_num_layers,
+            num_neighbors=args.num_neighbors,
+        )
 
         for split in splits:
-            rows.append(
-                _result_row(
-                    spec,
-                    split,
-                    "base",
-                    None,
-                    "ok",
-                    compute_base_coverage_for_split(
-                        task,
+            try:
+                rows.append(
+                    _result_row(
+                        spec,
                         split,
-                        base_interactions,
-                    ),
+                        "base",
+                        None,
+                        "ok",
+                        compute_sampled_subgraph_coverage_for_split(
+                            base_graph,
+                            task,
+                            split,
+                            num_neighbors=base_num_neighbors,
+                            batch_size=args.batch_size,
+                            temporal_strategy=args.temporal_strategy,
+                            num_workers=args.num_workers,
+                        ),
+                    )
                 )
-            )
+            except Exception as exc:
+                row = _unavailable_row(spec, split, "base", "error")
+                row["error"] = str(exc)
+                rows.append(row)
 
             if spec.item_cf:
                 item_dirs = manifest_index.find(spec.dataset, spec.task, "item_cf")
@@ -199,8 +266,13 @@ def main() -> None:
                             task,
                             split,
                             db,
+                            base_graph,
                             snapshot_dir,
                             args.item_cf_num_layers,
+                            args.num_neighbors,
+                            args.batch_size,
+                            args.temporal_strategy,
+                            args.num_workers,
                         ),
                     )
                 )
@@ -220,7 +292,13 @@ def main() -> None:
                             task,
                             split,
                             db,
+                            base_graph,
                             snapshot_dir,
+                            args.user_cf_num_layers,
+                            args.num_neighbors,
+                            args.batch_size,
+                            args.temporal_strategy,
+                            args.num_workers,
                         ),
                     )
                 )
@@ -239,8 +317,13 @@ def main() -> None:
                             spec,
                             task,
                             split,
+                            base_graph,
                             snapshot_dir,
                             args.trial_cf_num_layers,
+                            args.num_neighbors,
+                            args.batch_size,
+                            args.temporal_strategy,
+                            args.num_workers,
                         ),
                     )
                 )
@@ -301,6 +384,179 @@ class ManifestIndex:
         return out
 
 
+def make_topology_graph(db) -> HeteroData:
+    """Build a feature-free graph with the same pkey/fkey topology as RelBench."""
+    data = HeteroData()
+    for table_name, table in db.table_dict.items():
+        data[table_name].num_nodes = len(table.df)
+        if table.time_col is not None:
+            data[table_name].time = torch.from_numpy(to_unix_time(table.df[table.time_col]))
+
+        df = table.df
+        for fkey_name, pkey_table_name in table.fkey_col_to_pkey_table.items():
+            pkey_index = df[fkey_name]
+            mask = ~pkey_index.isna()
+            fkey_index = torch.arange(len(pkey_index))
+            pkey_tensor = torch.from_numpy(pkey_index[mask].astype(int).values)
+            fkey_tensor = fkey_index[torch.from_numpy(mask.values)]
+
+            edge_index = torch.stack([fkey_tensor, pkey_tensor], dim=0)
+            edge_type = (table_name, f"f2p_{fkey_name}", pkey_table_name)
+            data[edge_type].edge_index = sort_edge_index(edge_index)
+
+            edge_index = torch.stack([pkey_tensor, fkey_tensor], dim=0)
+            edge_type = (pkey_table_name, f"rev_f2p_{fkey_name}", table_name)
+            data[edge_type].edge_index = sort_edge_index(edge_index)
+    data.validate()
+    return data
+
+
+def build_uniform_num_neighbors(
+    edge_types,
+    *,
+    num_layers: int,
+    num_neighbors: int,
+) -> dict:
+    if num_layers < 1:
+        raise ValueError("num_layers must be positive.")
+    hop_fanouts = [int(num_neighbors // 2**i) for i in range(num_layers)]
+    return {edge_type: list(hop_fanouts) for edge_type in edge_types}
+
+
+def compute_sampled_subgraph_coverage_for_split(
+    graph: HeteroData,
+    task: RecommendationTask,
+    split: str,
+    *,
+    num_neighbors,
+    batch_size: int,
+    temporal_strategy: str,
+    num_workers: int,
+) -> CoverageMetrics:
+    table = task.get_table(split, mask_input_cols=False)
+    return compute_sampled_subgraph_coverage_for_table(
+        graph,
+        table,
+        task,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        temporal_strategy=temporal_strategy,
+        num_workers=num_workers,
+    )
+
+
+def compute_sampled_subgraph_coverage_for_table(
+    graph: HeteroData,
+    table: Table,
+    task: RecommendationTask,
+    *,
+    num_neighbors,
+    batch_size: int,
+    temporal_strategy: str,
+    num_workers: int,
+) -> CoverageMetrics:
+    totals = _MutableTotals()
+    for group in group_recommendation_table_by_seed_time(table, task):
+        loader, _ = make_seed_time_loader(
+            graph,
+            group,
+            task,
+            num_neighbors=num_neighbors,
+            batch_size=batch_size,
+            temporal_strategy=temporal_strategy,
+            shuffle=False,
+            num_workers=num_workers,
+        )
+        for batch in loader:
+            _accumulate_sampled_batch_coverage(totals, batch, group.table, task)
+    return totals.freeze()
+
+
+def compute_dynamic_sampled_subgraph_coverage_for_split(
+    task: RecommendationTask,
+    split: str,
+    make_graph_and_neighbors: Callable[[object], tuple[HeteroData, object]],
+    *,
+    batch_size: int,
+    temporal_strategy: str,
+    num_workers: int,
+) -> CoverageMetrics:
+    table = task.get_table(split, mask_input_cols=False)
+    totals = _MutableTotals()
+    for group in group_recommendation_table_by_seed_time(table, task):
+        graph, num_neighbors = make_graph_and_neighbors(group)
+        loader, _ = make_seed_time_loader(
+            graph,
+            group,
+            task,
+            num_neighbors=num_neighbors,
+            batch_size=batch_size,
+            temporal_strategy=temporal_strategy,
+            shuffle=False,
+            num_workers=num_workers,
+        )
+        for batch in loader:
+            _accumulate_sampled_batch_coverage(totals, batch, group.table, task)
+    return totals.freeze()
+
+
+def _accumulate_sampled_batch_coverage(
+    totals: "_MutableTotals",
+    batch: HeteroData,
+    table: Table,
+    task: RecommendationTask,
+) -> None:
+    src_store = batch[task.src_entity_table]
+    batch_size = int(src_store.batch_size)
+    input_ids = src_store.input_id.cpu().numpy()
+    sampled_by_row = _sampled_dst_by_batch_row(batch, task.dst_entity_table, batch_size)
+
+    for row_pos, input_id in enumerate(input_ids):
+        row = table.df.iloc[int(input_id)]
+        true_dst = set(int(value) for value in row[task.dst_entity_col])
+        totals.num_rows += 1
+        if not true_dst:
+            continue
+
+        candidates = sampled_by_row.get(row_pos, set())
+        covered = len(true_dst.intersection(candidates))
+        totals.num_positive_rows += 1
+        totals.num_rows_with_candidates += int(bool(candidates))
+        totals.num_rows_with_hit += int(covered > 0)
+        totals.num_sampled_candidates += len(candidates)
+        totals.num_groundtruth_labels += len(true_dst)
+        totals.num_covered_groundtruth_labels += covered
+        totals.achievable_ap_sum += _oracle_average_precision_at_k(
+            covered,
+            len(true_dst),
+            task.eval_k,
+        )
+
+
+def _sampled_dst_by_batch_row(
+    batch: HeteroData,
+    dst_entity_table: str,
+    batch_size: int,
+) -> dict[int, set[int]]:
+    if dst_entity_table not in batch.node_types:
+        return {}
+    dst_store = batch[dst_entity_table]
+    if "batch" not in dst_store or "n_id" not in dst_store:
+        raise RuntimeError(
+            f"Sampled batch for {dst_entity_table!r} does not expose per-root "
+            "batch assignments. Install a temporal sampling backend compatible "
+            "with PyG disjoint NeighborLoader."
+        )
+    out = {idx: set() for idx in range(batch_size)}
+    row_ids = dst_store.batch.cpu().numpy()
+    node_ids = dst_store.n_id.cpu().numpy()
+    for row_id, node_id in zip(row_ids, node_ids):
+        row_id = int(row_id)
+        if 0 <= row_id < batch_size:
+            out[row_id].add(int(node_id))
+    return out
+
+
 def compute_base_coverage_for_split(
     task: RecommendationTask,
     split: str,
@@ -345,6 +601,7 @@ def compute_base_coverage_for_table(
             totals.num_covered_groundtruth_labels += covered
             totals.num_rows_with_candidates += int(bool(candidates))
             totals.num_rows_with_hit += int(covered > 0)
+            totals.num_sampled_candidates += len(candidates)
             totals.achievable_ap_sum += _oracle_average_precision_at_k(
                 covered,
                 len(true_dst),
@@ -360,6 +617,7 @@ class _MutableTotals:
     num_positive_rows: int = 0
     num_rows_with_candidates: int = 0
     num_rows_with_hit: int = 0
+    num_sampled_candidates: int = 0
     num_groundtruth_labels: int = 0
     num_covered_groundtruth_labels: int = 0
     achievable_ap_sum: float = 0.0
@@ -410,46 +668,106 @@ def _compute_item_cf(
     task: RecommendationTask,
     split: str,
     db,
+    base_graph: HeteroData,
     snapshot_dir: Path,
     num_layers: int,
+    num_neighbors: int,
+    batch_size: int,
+    temporal_strategy: str,
+    num_workers: int,
 ):
     if spec.dataset == "rel-hm":
         config = validate_hm_item_cf(snapshot_dir)
-        transactions = db.table_dict["transactions"].df.sort_values(
-            "t_dat", kind="mergesort"
-        ).reset_index(drop=True)
-        return compute_hm_item_cf(
+
+        def make_graph_and_neighbors(group):
+            snapshot = load_hm_item_cf_snapshot(
+                snapshot_dir,
+                group.seed_time,
+                validate=True,
+                config=config,
+                num_articles=task.num_dst_nodes,
+            )
+            graph = attach_hm_item_cf_snapshot(
+                base_graph,
+                snapshot,
+                group.seed_time,
+                num_articles=task.num_dst_nodes,
+            )
+            return graph, build_hm_item_cf_num_neighbors(
+                graph.edge_types,
+                num_layers=num_layers,
+                num_neighbors=num_neighbors,
+            )
+
+        return compute_dynamic_sampled_subgraph_coverage_for_split(
             task,
             split,
-            transactions,
-            snapshot_dir,
-            config=config,
-            num_articles=task.num_dst_nodes,
-            num_layers=num_layers,
+            make_graph_and_neighbors,
+            batch_size=batch_size,
+            temporal_strategy=temporal_strategy,
+            num_workers=num_workers,
         )
     if spec.dataset == "rel-avito":
         config = validate_avito_item_cf(snapshot_dir)
-        interactions = filter_visit_interactions(db.table_dict["VisitStream"].df)
-        return compute_avito_item_cf(
+
+        def make_graph_and_neighbors(group):
+            snapshot = load_avito_item_cf_snapshot(
+                snapshot_dir,
+                group.seed_time,
+                validate=True,
+                config=config,
+                num_ads=task.num_dst_nodes,
+            )
+            graph = attach_avito_item_cf_snapshot(
+                base_graph,
+                snapshot,
+                group.seed_time,
+                num_ads=task.num_dst_nodes,
+            )
+            return graph, build_avito_item_cf_num_neighbors(
+                graph.edge_types,
+                num_layers=num_layers,
+                num_neighbors=num_neighbors,
+            )
+
+        return compute_dynamic_sampled_subgraph_coverage_for_split(
             task,
             split,
-            interactions,
-            snapshot_dir,
-            config=config,
-            num_ads=task.num_dst_nodes,
-            num_layers=num_layers,
+            make_graph_and_neighbors,
+            batch_size=batch_size,
+            temporal_strategy=temporal_strategy,
+            num_workers=num_workers,
         )
     if spec.dataset == "rel-stack":
         config = validate_stack_item_cf(snapshot_dir)
-        interactions = filter_comment_interactions(db.table_dict["comments"].df)
-        return compute_stack_item_cf(
+
+        def make_graph_and_neighbors(group):
+            snapshot = load_stack_item_cf_snapshot(
+                snapshot_dir,
+                group.seed_time,
+                validate=True,
+                config=config,
+                num_posts=task.num_dst_nodes,
+            )
+            graph = attach_stack_item_cf_snapshot(
+                base_graph,
+                snapshot,
+                group.seed_time,
+                num_posts=task.num_dst_nodes,
+            )
+            return graph, build_stack_item_cf_num_neighbors(
+                graph.edge_types,
+                num_layers=num_layers,
+                num_neighbors=num_neighbors,
+            )
+
+        return compute_dynamic_sampled_subgraph_coverage_for_split(
             task,
             split,
-            interactions,
-            snapshot_dir,
-            config=config,
-            num_posts=task.num_dst_nodes,
-            num_layers=num_layers,
+            make_graph_and_neighbors,
+            batch_size=batch_size,
+            temporal_strategy=temporal_strategy,
+            num_workers=num_workers,
         )
     raise ValueError(f"Item-CF is not supported for {spec.dataset}/{spec.task}.")
 
@@ -459,31 +777,75 @@ def _compute_user_cf(
     task: RecommendationTask,
     split: str,
     db,
+    base_graph: HeteroData,
     snapshot_dir: Path,
+    num_layers: int,
+    num_neighbors: int,
+    batch_size: int,
+    temporal_strategy: str,
+    num_workers: int,
 ):
     if spec.dataset == "rel-hm":
         config = validate_hm_user_cf(snapshot_dir)
-        transactions = db.table_dict["transactions"].df.sort_values(
-            "t_dat", kind="mergesort"
-        ).reset_index(drop=True)
-        return compute_hm_user_cf(
+
+        def make_graph_and_neighbors(group):
+            snapshot = load_hm_user_cf_snapshot(
+                snapshot_dir,
+                group.seed_time,
+                validate=True,
+                config=config,
+                num_customers=task.num_src_nodes,
+            )
+            graph = attach_hm_user_cf_snapshot(
+                base_graph,
+                snapshot,
+                group.seed_time,
+                num_customers=task.num_src_nodes,
+            )
+            return graph, build_hm_user_cf_num_neighbors(
+                graph.edge_types,
+                num_layers=num_layers,
+                num_neighbors=num_neighbors,
+            )
+
+        return compute_dynamic_sampled_subgraph_coverage_for_split(
             task,
             split,
-            transactions,
-            snapshot_dir,
-            config=config,
-            num_customers=task.num_src_nodes,
+            make_graph_and_neighbors,
+            batch_size=batch_size,
+            temporal_strategy=temporal_strategy,
+            num_workers=num_workers,
         )
     if spec.dataset == "rel-avito":
         config = validate_avito_user_cf(snapshot_dir)
-        interactions = filter_visit_interactions(db.table_dict["VisitStream"].df)
-        return compute_avito_user_cf(
+
+        def make_graph_and_neighbors(group):
+            snapshot = load_avito_user_cf_snapshot(
+                snapshot_dir,
+                group.seed_time,
+                validate=True,
+                config=config,
+                num_users=task.num_src_nodes,
+            )
+            graph = attach_avito_user_cf_snapshot(
+                base_graph,
+                snapshot,
+                group.seed_time,
+                num_users=task.num_src_nodes,
+            )
+            return graph, build_avito_user_cf_num_neighbors(
+                graph.edge_types,
+                num_layers=num_layers,
+                num_neighbors=num_neighbors,
+            )
+
+        return compute_dynamic_sampled_subgraph_coverage_for_split(
             task,
             split,
-            interactions,
-            snapshot_dir,
-            config=config,
-            num_users=task.num_src_nodes,
+            make_graph_and_neighbors,
+            batch_size=batch_size,
+            temporal_strategy=temporal_strategy,
+            num_workers=num_workers,
         )
     raise ValueError(f"User-CF is not supported for {spec.dataset}/{spec.task}.")
 
@@ -492,20 +854,49 @@ def _compute_trial_cf(
     spec: TargetSpec,
     task: RecommendationTask,
     split: str,
+    base_graph: HeteroData,
     snapshot_dir: Path,
     num_layers: int,
+    num_neighbors: int,
+    batch_size: int,
+    temporal_strategy: str,
+    num_workers: int,
 ):
     config = validate_trial_route_cf(snapshot_dir)
     if config.task != spec.task:
         raise ValueError(f"Snapshot task {config.task!r} does not match {spec.task!r}.")
-    return compute_trial_route_cf(
+
+    def make_graph_and_neighbors(group):
+        snapshot = load_trial_cf_snapshot(
+            snapshot_dir,
+            group.seed_time,
+            validate=True,
+            config=config,
+            num_sources=task.num_src_nodes,
+            num_sponsors=task.num_dst_nodes,
+        )
+        graph = attach_trial_cf_snapshot(
+            base_graph,
+            snapshot,
+            group.seed_time,
+            config=config,
+            num_sources=task.num_src_nodes,
+            num_sponsors=task.num_dst_nodes,
+        )
+        return graph, build_trial_cf_num_neighbors(
+            graph.edge_types,
+            config=config,
+            num_layers=num_layers,
+            num_neighbors=num_neighbors,
+        )
+
+    return compute_dynamic_sampled_subgraph_coverage_for_split(
         task,
         split,
-        snapshot_dir,
-        config=config,
-        num_sources=task.num_src_nodes,
-        num_sponsors=task.num_dst_nodes,
-        num_layers=num_layers,
+        make_graph_and_neighbors,
+        batch_size=batch_size,
+        temporal_strategy=temporal_strategy,
+        num_workers=num_workers,
     )
 
 
@@ -582,13 +973,17 @@ def _unavailable_row(
         "num_positive_rows": np.nan,
         "num_rows_with_candidates": np.nan,
         "num_rows_with_hit": np.nan,
+        "num_sampled_candidates": np.nan,
         "num_groundtruth_labels": np.nan,
         "num_covered_groundtruth_labels": np.nan,
         "achievable_ap_sum": np.nan,
         "coverage_rate": np.nan,
+        "sampled_subgraph_coverage_rate": np.nan,
         "hit_rate": np.nan,
         "achievable_MAP": np.nan,
         "coverage_gap": np.nan,
+        "sampled_candidate_precision": np.nan,
+        "mean_sampled_candidates_per_positive_row": np.nan,
     }
 
 

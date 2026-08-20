@@ -4,9 +4,13 @@ import json
 
 import numpy as np
 import pandas as pd
+import torch
+from torch_geometric.data import HeteroData
 
 from examples.evaluate_recommendation_coverage import (
     ManifestIndex,
+    _MutableTotals,
+    _accumulate_sampled_batch_coverage,
     compute_base_coverage_for_table,
 )
 from relbench.base import Table
@@ -105,3 +109,33 @@ def test_manifest_index_distinguishes_cf_kinds(tmp_path):
         trial_dir
     ]
 
+
+def test_sampled_batch_coverage_is_source_specific():
+    batch = HeteroData()
+    batch["users"].batch_size = 2
+    batch["users"].input_id = torch.tensor([0, 1])
+    batch["items"].n_id = torch.tensor([2, 3, 4, 5])
+    batch["items"].batch = torch.tensor([0, 0, 1, 1])
+    table = Table(
+        df=pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2020-01-01", "2020-01-01"]),
+                "user_id": pd.Series([0, 1], dtype="int64"),
+                "item_id": [[2, 9], [4]],
+            }
+        ),
+        fkey_col_to_pkey_table={"user_id": "users", "item_id": "items"},
+        pkey_col=None,
+        time_col="timestamp",
+    )
+    totals = _MutableTotals()
+
+    _accumulate_sampled_batch_coverage(totals, batch, table, _Task())
+    metrics = totals.freeze()
+
+    assert metrics.num_rows == 2
+    assert metrics.num_sampled_candidates == 4
+    assert metrics.num_groundtruth_labels == 3
+    assert metrics.num_covered_groundtruth_labels == 2
+    assert np.isclose(metrics.coverage_rate, 2 / 3)
+    assert np.isclose(metrics.sampled_candidate_precision, 2 / 4)
