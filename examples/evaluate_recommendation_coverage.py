@@ -53,6 +53,12 @@ from .stack_cf.graph import (
 from .stack_cf.interactions import filter_comment_interactions
 from .stack_cf.io import load_snapshot as load_stack_item_cf_snapshot
 from .stack_cf.io import validate_manifest_for_training as validate_stack_item_cf
+from .stack_user_cf.graph import (
+    attach_user_cf_snapshot as attach_stack_user_cf_snapshot,
+    build_user_cf_num_neighbors as build_stack_user_cf_num_neighbors,
+)
+from .stack_user_cf.io import load_snapshot as load_stack_user_cf_snapshot
+from .stack_user_cf.io import validate_manifest_for_training as validate_stack_user_cf
 from .trial_cf.config import TrialCFSnapshotConfig
 from .trial_cf.graph import (
     attach_cf_snapshot as attach_trial_cf_snapshot,
@@ -137,7 +143,7 @@ class TargetSpec:
 TARGETS = [
     TargetSpec("rel-hm", "user-item-purchase", item_cf=True, user_cf=True),
     TargetSpec("rel-avito", "user-ad-visit", item_cf=True, user_cf=True),
-    TargetSpec("rel-stack", "user-post-comment", item_cf=True, user_cf=False),
+    TargetSpec("rel-stack", "user-post-comment", item_cf=True, user_cf=True),
     TargetSpec(
         "rel-trial",
         "condition-sponsor-run",
@@ -190,6 +196,23 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Additional root(s) to search only for Rel-Trial route-CF snapshots.",
     )
+    parser.add_argument(
+        "--dataset",
+        action="append",
+        default=[],
+        help="Dataset name(s) to evaluate. Defaults to all supported datasets.",
+    )
+    parser.add_argument(
+        "--task",
+        action="append",
+        default=[],
+        help="Task name(s) to evaluate. Defaults to all supported tasks.",
+    )
+    parser.add_argument(
+        "--coverage-kinds",
+        default="base,item_cf,user_cf,trial_cf",
+        help="Comma-separated coverage kinds to evaluate.",
+    )
     parser.add_argument("--splits", default="val,test")
     parser.add_argument("--output-csv", type=Path)
     parser.add_argument("--output-json", type=Path)
@@ -208,6 +231,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     splits = [split.strip() for split in args.splits.split(",") if split.strip()]
+    coverage_kinds = {
+        value.strip() for value in args.coverage_kinds.split(",") if value.strip()
+    }
+    unknown_kinds = coverage_kinds.difference({"base", "item_cf", "user_cf", "trial_cf"})
+    if unknown_kinds:
+        raise ValueError(f"Unknown coverage kinds: {sorted(unknown_kinds)}")
+    targets = _selected_targets(args.dataset, args.task)
     manifest_index = ManifestIndex(
         item_roots=[*args.snapshot_root, *args.item_cf_root],
         user_roots=[*args.snapshot_root, *args.user_cf_root],
@@ -215,7 +245,7 @@ def main() -> None:
     )
 
     rows: list[dict] = []
-    for spec in TARGETS:
+    for spec in targets:
         dataset = get_dataset(spec.dataset, download=args.download)
         task = get_task(spec.dataset, spec.task, download=args.download)
         if not isinstance(task, RecommendationTask):
@@ -229,31 +259,32 @@ def main() -> None:
         )
 
         for split in splits:
-            try:
-                rows.append(
-                    _result_row(
-                        spec,
-                        split,
-                        "base",
-                        None,
-                        "ok",
-                        compute_sampled_subgraph_coverage_for_split(
-                            base_graph,
-                            task,
+            if "base" in coverage_kinds:
+                try:
+                    rows.append(
+                        _result_row(
+                            spec,
                             split,
-                            num_neighbors=base_num_neighbors,
-                            batch_size=args.batch_size,
-                            temporal_strategy=args.temporal_strategy,
-                            num_workers=args.num_workers,
-                        ),
+                            "base",
+                            None,
+                            "ok",
+                            compute_sampled_subgraph_coverage_for_split(
+                                base_graph,
+                                task,
+                                split,
+                                num_neighbors=base_num_neighbors,
+                                batch_size=args.batch_size,
+                                temporal_strategy=args.temporal_strategy,
+                                num_workers=args.num_workers,
+                            ),
+                        )
                     )
-                )
-            except Exception as exc:
-                row = _unavailable_row(spec, split, "base", "error")
-                row["error"] = str(exc)
-                rows.append(row)
+                except Exception as exc:
+                    row = _unavailable_row(spec, split, "base", "error")
+                    row["error"] = str(exc)
+                    rows.append(row)
 
-            if spec.item_cf:
+            if "item_cf" in coverage_kinds and spec.item_cf:
                 item_dirs = manifest_index.find(spec.dataset, spec.task, "item_cf")
                 rows.extend(
                     _cf_rows(
@@ -276,10 +307,10 @@ def main() -> None:
                         ),
                     )
                 )
-            else:
+            elif "item_cf" in coverage_kinds:
                 rows.append(_unavailable_row(spec, split, "item_cf", "not_supported"))
 
-            if spec.user_cf:
+            if "user_cf" in coverage_kinds and spec.user_cf:
                 user_dirs = manifest_index.find(spec.dataset, spec.task, "user_cf")
                 rows.extend(
                     _cf_rows(
@@ -302,10 +333,10 @@ def main() -> None:
                         ),
                     )
                 )
-            else:
+            elif "user_cf" in coverage_kinds:
                 rows.append(_unavailable_row(spec, split, "user_cf", "not_supported"))
 
-            if spec.route_cf:
+            if "trial_cf" in coverage_kinds and spec.route_cf:
                 trial_dirs = manifest_index.find(spec.dataset, spec.task, "trial_cf")
                 rows.extend(
                     _cf_rows(
@@ -327,6 +358,8 @@ def main() -> None:
                         ),
                     )
                 )
+            elif "trial_cf" in coverage_kinds and spec.dataset == "rel-trial":
+                rows.append(_unavailable_row(spec, split, "trial_cf", "not_supported"))
 
     df = pd.DataFrame(rows)
     _write_outputs(df, args.output_csv, args.output_json)
@@ -382,6 +415,23 @@ class ManifestIndex:
                 with open(path, "r", encoding="utf-8") as f:
                     out.append((path, json.load(f)))
         return out
+
+
+def _selected_targets(dataset_names: list[str], task_names: list[str]) -> list[TargetSpec]:
+    dataset_filter = set(dataset_names)
+    task_filter = set(task_names)
+    targets = [
+        spec
+        for spec in TARGETS
+        if (not dataset_filter or spec.dataset in dataset_filter)
+        and (not task_filter or spec.task in task_filter)
+    ]
+    if not targets:
+        raise ValueError(
+            "No supported targets matched "
+            f"dataset={sorted(dataset_filter)} task={sorted(task_filter)}."
+        )
+    return targets
 
 
 def make_topology_graph(db) -> HeteroData:
@@ -847,6 +897,37 @@ def _compute_user_cf(
             temporal_strategy=temporal_strategy,
             num_workers=num_workers,
         )
+    if spec.dataset == "rel-stack":
+        config = validate_stack_user_cf(snapshot_dir)
+
+        def make_graph_and_neighbors(group):
+            snapshot = load_stack_user_cf_snapshot(
+                snapshot_dir,
+                group.seed_time,
+                validate=True,
+                config=config,
+                num_users=task.num_src_nodes,
+            )
+            graph = attach_stack_user_cf_snapshot(
+                base_graph,
+                snapshot,
+                group.seed_time,
+                num_users=task.num_src_nodes,
+            )
+            return graph, build_stack_user_cf_num_neighbors(
+                graph.edge_types,
+                num_layers=num_layers,
+                num_neighbors=num_neighbors,
+            )
+
+        return compute_dynamic_sampled_subgraph_coverage_for_split(
+            task,
+            split,
+            make_graph_and_neighbors,
+            batch_size=batch_size,
+            temporal_strategy=temporal_strategy,
+            num_workers=num_workers,
+        )
     raise ValueError(f"User-CF is not supported for {spec.dataset}/{spec.task}.")
 
 
@@ -1031,7 +1112,16 @@ def _is_item_cf_manifest(manifest: dict) -> bool:
         return False
     if manifest.get("cf_route") == "source_sponsor_route_collapsed":
         return False
-    return manifest.get("cf_node_type") in {"article_cf", "ad_cf", "post_cf"}
+    if manifest.get("cf_node_type") in {"article_cf", "ad_cf", "post_cf"}:
+        return True
+    return (
+        manifest.get("dataset") == "rel-hm"
+        and manifest.get("task") == "user-item-purchase"
+        and "window_weeks" in manifest
+        and "min_support" in manifest
+        and "top_l" in manifest
+        and "alpha" in manifest
+    )
 
 
 def _is_user_cf_manifest(manifest: dict) -> bool:

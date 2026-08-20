@@ -11,6 +11,7 @@ from examples.evaluate_recommendation_coverage import (
     ManifestIndex,
     _MutableTotals,
     _accumulate_sampled_batch_coverage,
+    _selected_targets,
     compute_base_coverage_for_table,
 )
 from relbench.base import Table
@@ -60,10 +61,14 @@ def test_base_coverage_uses_history_until_seed_time():
 
 def test_manifest_index_distinguishes_cf_kinds(tmp_path):
     item_dir = tmp_path / "item"
+    legacy_hm_item_dir = tmp_path / "legacy_hm_item"
     user_dir = tmp_path / "user"
+    stack_user_dir = tmp_path / "stack_user"
     trial_dir = tmp_path / "trial"
     item_dir.mkdir()
+    legacy_hm_item_dir.mkdir()
     user_dir.mkdir()
+    stack_user_dir.mkdir()
     trial_dir.mkdir()
     (item_dir / "manifest.json").write_text(
         json.dumps(
@@ -75,11 +80,36 @@ def test_manifest_index_distinguishes_cf_kinds(tmp_path):
         ),
         encoding="utf-8",
     )
+    (legacy_hm_item_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "rel-hm",
+                "task": "user-item-purchase",
+                "window_weeks": 8,
+                "all_history": False,
+                "min_support": 3,
+                "top_l": 32,
+                "alpha": 0.5,
+            }
+        ),
+        encoding="utf-8",
+    )
     (user_dir / "manifest.json").write_text(
         json.dumps(
             {
                 "dataset": "rel-hm",
                 "task": "user-item-purchase",
+                "cf_kind": "user_user_history_overlap",
+                "cf_node_type": "user_cf",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (stack_user_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "rel-stack",
+                "task": "user-post-comment",
                 "cf_kind": "user_user_history_overlap",
                 "cf_node_type": "user_cf",
             }
@@ -103,11 +133,25 @@ def test_manifest_index_distinguishes_cf_kinds(tmp_path):
         trial_roots=[tmp_path],
     )
 
-    assert index.find("rel-hm", "user-item-purchase", "item_cf") == [item_dir]
+    assert index.find("rel-hm", "user-item-purchase", "item_cf") == [
+        item_dir,
+        legacy_hm_item_dir,
+    ]
     assert index.find("rel-hm", "user-item-purchase", "user_cf") == [user_dir]
+    assert index.find("rel-stack", "user-post-comment", "user_cf") == [
+        stack_user_dir
+    ]
     assert index.find("rel-trial", "condition-sponsor-run", "trial_cf") == [
         trial_dir
     ]
+
+
+def test_selected_targets_filters_dataset_and_task():
+    targets = _selected_targets(["rel-hm"], ["user-item-purchase"])
+
+    assert len(targets) == 1
+    assert targets[0].dataset == "rel-hm"
+    assert targets[0].task == "user-item-purchase"
 
 
 def test_sampled_batch_coverage_is_source_specific():
