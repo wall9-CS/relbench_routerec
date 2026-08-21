@@ -140,6 +140,9 @@ class TargetSpec:
     route_cf: bool = False
 
 
+ALL_COVERAGE_KINDS = ("base", "item_cf", "user_cf", "trial_cf")
+
+
 TARGETS = [
     TargetSpec("rel-hm", "user-item-purchase", item_cf=True, user_cf=True),
     TargetSpec("rel-avito", "user-ad-visit", item_cf=True, user_cf=True),
@@ -210,8 +213,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--coverage-kinds",
-        default="base,item_cf,user_cf,trial_cf",
-        help="Comma-separated coverage kinds to evaluate.",
+        default="all",
+        help=(
+            "Comma-separated coverage kinds to evaluate. "
+            f"Use 'all' for {','.join(ALL_COVERAGE_KINDS)}."
+        ),
     )
     parser.add_argument("--splits", default="val,test")
     parser.add_argument("--output-csv", type=Path)
@@ -231,12 +237,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     splits = [split.strip() for split in args.splits.split(",") if split.strip()]
-    coverage_kinds = {
-        value.strip() for value in args.coverage_kinds.split(",") if value.strip()
-    }
-    unknown_kinds = coverage_kinds.difference({"base", "item_cf", "user_cf", "trial_cf"})
-    if unknown_kinds:
-        raise ValueError(f"Unknown coverage kinds: {sorted(unknown_kinds)}")
+    coverage_kinds = _parse_coverage_kinds(args.coverage_kinds)
     targets = _selected_targets(args.dataset, args.task)
     manifest_index = ManifestIndex(
         item_roots=[*args.snapshot_root, *args.item_cf_root],
@@ -432,6 +433,19 @@ def _selected_targets(dataset_names: list[str], task_names: list[str]) -> list[T
             f"dataset={sorted(dataset_filter)} task={sorted(task_filter)}."
         )
     return targets
+
+
+def _parse_coverage_kinds(value: str) -> set[str]:
+    coverage_kinds = {part.strip() for part in value.split(",") if part.strip()}
+    if not coverage_kinds:
+        raise ValueError("At least one coverage kind must be specified.")
+    valid_kinds = {*ALL_COVERAGE_KINDS, "all"}
+    unknown_kinds = coverage_kinds.difference(valid_kinds)
+    if unknown_kinds:
+        raise ValueError(f"Unknown coverage kinds: {sorted(unknown_kinds)}")
+    if "all" in coverage_kinds:
+        return set(ALL_COVERAGE_KINDS)
+    return coverage_kinds
 
 
 def make_topology_graph(db) -> HeteroData:

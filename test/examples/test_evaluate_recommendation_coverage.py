@@ -8,9 +8,11 @@ import torch
 from torch_geometric.data import HeteroData
 
 from examples.evaluate_recommendation_coverage import (
+    ALL_COVERAGE_KINDS,
     ManifestIndex,
     _MutableTotals,
     _accumulate_sampled_batch_coverage,
+    _parse_coverage_kinds,
     _selected_targets,
     compute_base_coverage_for_table,
 )
@@ -152,6 +154,20 @@ def test_selected_targets_filters_dataset_and_task():
     assert len(targets) == 1
     assert targets[0].dataset == "rel-hm"
     assert targets[0].task == "user-item-purchase"
+
+
+def test_default_targets_include_hm_and_stack_user_cf():
+    targets_by_key = {
+        (target.dataset, target.task): target for target in _selected_targets([], [])
+    }
+
+    assert targets_by_key[("rel-hm", "user-item-purchase")].user_cf
+    assert targets_by_key[("rel-stack", "user-post-comment")].user_cf
+
+
+def test_parse_coverage_kinds_supports_all_alias():
+    assert _parse_coverage_kinds("all") == set(ALL_COVERAGE_KINDS)
+    assert _parse_coverage_kinds("base,user_cf") == {"base", "user_cf"}
 
 
 def test_sampled_batch_coverage_is_source_specific():
