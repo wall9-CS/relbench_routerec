@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history-days", type=int, default=None)
     parser.add_argument("--all-history", action="store_true")
     parser.add_argument("--min-support", type=int, default=1)
-    parser.add_argument("--top-l", type=int, default=64)
+    parser.add_argument("--top-l", type=int, default=16)
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--splits", default="train,val,test")
