@@ -1,0 +1,24 @@
+{
+  "all_history": false,
+  "binary_interactions": true,
+  "contains_graph_augmentation": false,
+  "contains_katz": false,
+  "contains_oracle_relations": false,
+  "dataset": "rel-hm",
+  "fanout": [
+    128,
+    64,
+    32,
+    16
+  ],
+  "files": {},
+  "history_matrix_layout": "active_user_rows_by_global_article_columns",
+  "num_layers": 4,
+  "num_neighbors": 128,
+  "phase": "oracle_gt_phase1_preprocessing",
+  "sampler_seed": 123,
+  "task": "user-item-purchase",
+  "temporal_strategy": "last",
+  "window_boundary": "(seed_time - window, seed_time]",
+  "window_weeks": 8
+}

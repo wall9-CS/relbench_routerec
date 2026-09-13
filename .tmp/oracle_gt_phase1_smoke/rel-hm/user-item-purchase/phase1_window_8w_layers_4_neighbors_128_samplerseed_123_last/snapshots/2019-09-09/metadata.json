@@ -1,0 +1,22 @@
+{
+  "active_user_ids_dtype": "int64",
+  "elapsed_seconds": 0.04303641699516447,
+  "matrix_nnz": 98075,
+  "matrix_shape": [
+    30797,
+    105542
+  ],
+  "max_interaction_time": "2019-09-09T00:00:00",
+  "min_interaction_time": "2019-09-07T00:00:00",
+  "num_active_items": 15209,
+  "num_active_users": 30797,
+  "num_global_items": 105542,
+  "num_global_users": 1371980,
+  "num_historical_interactions": 98075,
+  "num_raw_transactions": 109909,
+  "seed_time": "2019-09-09T00:00:00",
+  "snapshot_id": "2019-09-09T00:00:00",
+  "temporal_boundary_ok": true,
+  "window_end": "2019-09-09T00:00:00",
+  "window_start": "2019-07-15T00:00:00"
+}
